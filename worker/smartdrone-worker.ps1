@@ -17,7 +17,7 @@
 # Config: C:\SmartDroneWorker\config.json (written by install-worker.ps1).
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-08-30.99'  # logged at startup — proves which script revision is running
+$ScriptVersion = '2026-09-01.100'  # logged at startup — proves which script revision is running
 $ConfigDir = 'C:\SmartDroneWorker'
 $Config = Get-Content (Join-Path $ConfigDir 'config.json') -Raw | ConvertFrom-Json
 $LogFile = Join-Path $ConfigDir 'worker.log'
@@ -348,28 +348,95 @@ function Add-Report($Stage, $Info = $null) {
 # Which machine is this? Needed to compare stage timings ACROSS GPU types — a stage that is slow
 # on one instance family and fast on another is a scheduling decision, not a mystery. IMDSv2
 # first (token required on newer AMIs), falling back to v1. Cached: it never changes at runtime.
-$script:InstanceTypeCache = $null
-function Get-InstanceType {
-    if ($script:InstanceTypeCache) { return $script:InstanceTypeCache }
-    $t = 'unknown'
+# One reader for every metadata name (instance-type, instance-id) so the two answers can never
+# come from different code paths with different fallbacks.
+$script:ImdsCache = @{}
+function Get-ImdsValue($Name, $Fallback = 'unknown') {
+    if ($script:ImdsCache.ContainsKey($Name)) { return $script:ImdsCache[$Name] }
+    $v = $null
     try {
         $tok = Invoke-RestMethod -Method Put -Uri 'http://169.254.169.254/latest/api/token' `
             -Headers @{ 'X-aws-ec2-metadata-token-ttl-seconds' = '60' } -TimeoutSec 3 -ErrorAction Stop
-        $t = Invoke-RestMethod -Uri 'http://169.254.169.254/latest/meta-data/instance-type' `
+        $v = Invoke-RestMethod -Uri "http://169.254.169.254/latest/meta-data/$Name" `
             -Headers @{ 'X-aws-ec2-metadata-token' = $tok } -TimeoutSec 3 -ErrorAction Stop
     } catch {
-        try { $t = Invoke-RestMethod -Uri 'http://169.254.169.254/latest/meta-data/instance-type' -TimeoutSec 3 -ErrorAction Stop } catch { }
+        try { $v = Invoke-RestMethod -Uri "http://169.254.169.254/latest/meta-data/$Name" -TimeoutSec 3 -ErrorAction Stop } catch { }
     }
-    $script:InstanceTypeCache = "$t"
-    return $script:InstanceTypeCache
+    $v = "$v".Trim()
+    if (-not $v) { $v = "$Fallback" }
+    if (-not $v) { $v = 'unknown' }
+    $script:ImdsCache[$Name] = $v
+    return $v
+}
+function Get-InstanceType { return (Get-ImdsValue 'instance-type' 'unknown') }
+# The instance ID keys the boot/shutdown events below. Without IMDS (a dev box) the computer
+# name stands in, so the events still land somewhere findable rather than under 'unknown'.
+function Get-InstanceId { return (Get-ImdsValue 'instance-id' $env:COMPUTERNAME) }
+
+# ---- Admin diagnostics feed ---------------------------------------------------------------
+#
+# Everything under telemetry/ in the bucket is the admin diagnostics feed: one record per job
+# (telemetry/<jobId>.json, written on EVERY exit - done, error, cancelled) and one per instance
+# lifecycle event (telemetry/instance/<instanceId>/<stamp>-boot.json and ...-shutdown.json).
+# Nothing is kept on this box: the scratch disk is wiped on every stop/start, so a record that
+# only lived here would be gone before anyone asked for it. Every write goes through here, and
+# NOTHING in here may throw - a diagnostics record is a footnote to the job, never the job.
+# Returns $true when the object landed, so callers can log success without a second guess.
+function Save-TelemetryObject($Key, $Record) {
+    try {
+        $tmp = Join-Path $TempDir ("sd-telemetry-{0}.json" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+        [IO.File]::WriteAllText($tmp, ($Record | ConvertTo-Json -Depth 6))
+        $rc = Invoke-AwsQuiet s3 cp $tmp "s3://$Bucket/telemetry/$Key" --no-progress
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        if ($rc -ne 0) { Log "Telemetry not recorded (aws exit $rc): telemetry/$Key"; return $false }
+        return $true
+    } catch {
+        Log "Telemetry not recorded ($($_.Exception.Message)): telemetry/$Key"
+        return $false
+    }
+}
+
+# One file per boot and per shutdown, keyed by instance, so a day's worth of starts and stops
+# reads as a timeline: when each boot happened, why it stopped, how long it had been idle and
+# how many jobs it ran in between. The billing questions ("why was the box up all night?") are
+# answered from these, not from guesswork over the worker log.
+$script:JobsRun = 0
+$script:QueuedAt = $null   # queue marker's queuedAt for the job being run (see Get-NextJob)
+function Save-InstanceEvent($Kind, $Extra = $null) {
+    try {
+        $now = (Get-Date).ToUniversalTime()
+        $id = Get-InstanceId
+        $rec = [ordered]@{
+            instanceId    = $id
+            instanceType  = Get-InstanceType
+            scriptVersion = $ScriptVersion
+        }
+        if ($Kind -eq 'boot') { $rec.bootedAt = $now.ToString('o') } else { $rec.shutdownAt = $now.ToString('o') }
+        if ($Extra) { foreach ($k in @($Extra.Keys)) { $rec[$k] = $Extra[$k] } }
+        # Filesystem-safe stamp (no colons - the key doubles as a sortable filename when the feed
+        # is mirrored to disk on the admin side). Backslashes make T and Z literal for .NET.
+        $stamp = $now.ToString('yyyyMMdd\THHmmss\Z')
+        $key = "instance/$id/$stamp-$Kind.json"
+        if (Save-TelemetryObject $key $rec) { Log "Instance $Kind event recorded (telemetry/$key)" }
+    } catch {
+        Log "Instance $Kind event not recorded: $($_.Exception.Message)"
+    }
 }
 
 # One row per finished job, in a central prefix, so stage timings can be compared across GPU
-# types later without trawling per-job result folders. Deliberately small and flat: instance
-# type, depth, photo count, and the seconds each stage took. Best effort — telemetry must never
-# be able to fail a job that has already produced its rasters.
-function Save-JobTelemetry($JobId, $Depth, $PhotoCount, $Ok) {
+# types later without trawling per-job result folders. Written on EVERY exit - done, error and
+# cancelled - because a history of survivors only cannot answer the admin view's questions
+# (which jobs ran long and died, who cancels what, how long the queue kept people waiting).
+# Still small and flat: instance, depth, photo count, who owns it, what happened, and the
+# seconds each stage took. Best effort — telemetry must never be able to fail a job that has
+# already produced its rasters.
+#
+# $Outcome is 'done' | 'error' | 'cancelled'; left out, it follows $Ok. $Manifest is the parsed
+# manifest.json (owner, totalBytes, createdAt come from it) and may be $null on a job that died
+# before it was read.
+function Save-JobTelemetry($JobId, $Depth, $PhotoCount, $Ok, $Outcome = $null, $ErrorMessage = $null, $Manifest = $null) {
     try {
+        if (-not $Outcome) { $Outcome = if ($Ok) { 'done' } else { 'error' } }
         # Per-stage seconds out of the report's STAGES ARRAY.
         #
         # This read $script:Report.Keys, which yields the report's four top-level names
@@ -377,6 +444,10 @@ function Save-JobTelemetry($JobId, $Depth, $PhotoCount, $Ok) {
         # was {} on EVERY job ever recorded, and the render-time model had nothing but job
         # totals to fit against. Add-Report appends to .stages; the duration is at
         # .stages[].info.seconds.
+        #
+        # SUMMED per stage name, not overwritten: a RealityScan phase that jams and is retried
+        # reports twice, and the mid-render deliveries report once per artefact. What a stage
+        # cost is all the wall time it took, the attempt that failed included.
         $stages = [ordered]@{}
         foreach ($entry in @($script:Report.stages)) {
             if (-not $entry) { continue }
@@ -384,24 +455,73 @@ function Save-JobTelemetry($JobId, $Depth, $PhotoCount, $Ok) {
             if ($name -notlike 'phase-done-*') { continue }
             $secs = $entry.info.seconds
             if ($null -eq $secs) { continue }
-            $stages[($name -replace '^phase-done-', '')] = [int]$secs
+            $key = $name -replace '^phase-done-', ''
+            if ($stages.Contains($key)) { $stages[$key] = [int]$stages[$key] + [int]$secs } else { $stages[$key] = [int]$secs }
+        }
+        # Claim time, as the moment this worker took the job (the same instant Write-Status
+        # 'claimed' went out).
+        $startedAt = if ($script:JobStarted) { $script:JobStarted.ToUniversalTime().ToString('o') } else { $null }
+        # Time spent WAITING before this worker picked the job up. Preferred source is the queue
+        # marker's queuedAt (read in Get-NextJob a moment before the marker is deleted); a marker
+        # without it falls back to the manifest's createdAt, which the app writes just before it
+        # queues. Both best effort - $null is an honest "not known", never a zero.
+        $queueWait = $null
+        $queuedAt = if ($script:QueuedAt) { "$($script:QueuedAt)" } elseif ($Manifest -and $Manifest.createdAt) { "$($Manifest.createdAt)" } else { $null }
+        if ($queuedAt -and $script:JobStarted) {
+            try {
+                $q = [DateTimeOffset]::Parse($queuedAt, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+                $queueWait = [int]($script:JobStarted.ToUniversalTime() - $q).TotalSeconds
+                if ($queueWait -lt 0) { $queueWait = 0 }
+            } catch { $queueWait = $null }
+        }
+        # Who the job belongs to, copied field by field: the device and project stamps the app
+        # writes into the manifest's owner, plus the licence when it is there. Nothing else from
+        # the manifest travels - no local paths, no photo lists.
+        $owner = $null
+        if ($Manifest -and $Manifest.owner) {
+            $owner = [ordered]@{}
+            foreach ($f in @('deviceId', 'projectName', 'projectId', 'licence')) {
+                $prop = $Manifest.owner.PSObject.Properties[$f]
+                if ($prop -and $null -ne $prop.Value) { $owner[$f] = $prop.Value }
+            }
+            if ($owner.Count -eq 0) { $owner = $null }
+        }
+        # Who pulled the plug. The app's cancel.json carries cancelledBy ('admin' from the admin
+        # view, 'user' from the owner's own app); a file without the field can only have come
+        # from the owner. The BODY is read here - Test-Cancelled only ever needs a HEAD.
+        $cancelledBy = $null
+        if ($Outcome -eq 'cancelled') {
+            $cancelledBy = 'user'
+            try {
+                $cancelRaw = aws s3 cp "s3://$Bucket/jobs/$JobId/cancel.json" - --no-progress 2>$null
+                if ($cancelRaw) {
+                    $cancel = ($cancelRaw -join "`n") | ConvertFrom-Json
+                    if ($cancel -and $cancel.cancelledBy) { $cancelledBy = "$($cancel.cancelledBy)" }
+                }
+            } catch { }
         }
         $rec = [ordered]@{
-            jobId        = $JobId
-            instanceType = Get-InstanceType
+            jobId         = $JobId
+            instanceId    = Get-InstanceId
+            instanceType  = Get-InstanceType
             scriptVersion = $ScriptVersion
-            depth        = $Depth
-            photos       = $PhotoCount
-            ok           = [bool]$Ok
-            totalSeconds = if ($script:JobStarted) { [int]((Get-Date) - $script:JobStarted).TotalSeconds } else { 0 }
-            stageSeconds = $stages
-            finishedAt   = (Get-Date).ToUniversalTime().ToString('o')
+            depth         = $Depth
+            photos        = $PhotoCount
+            photoBytes    = if ($Manifest -and $Manifest.totalBytes) { [long]$Manifest.totalBytes } else { $null }
+            owner         = $owner
+            ok            = [bool]$Ok
+            outcome       = $Outcome
+            error         = if ($ErrorMessage) { "$ErrorMessage" } else { $null }
+            cancelledBy   = $cancelledBy
+            startedAt     = $startedAt
+            finishedAt    = (Get-Date).ToUniversalTime().ToString('o')
+            totalSeconds  = if ($script:JobStarted) { [int]((Get-Date) - $script:JobStarted).TotalSeconds } else { 0 }
+            queueWaitSec  = $queueWait
+            stageSeconds  = $stages
         }
-        $tmp = Join-Path $TempDir "sd-telemetry-$JobId.json"
-        [IO.File]::WriteAllText($tmp, ($rec | ConvertTo-Json -Depth 5))
-        Invoke-AwsQuiet s3 cp $tmp "s3://$Bucket/telemetry/$JobId.json" --no-progress | Out-Null
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        Log "Job ${JobId}: telemetry recorded ($($rec.instanceType), $($rec.totalSeconds)s total)"
+        if (Save-TelemetryObject "$JobId.json" $rec) {
+            Log "Job ${JobId}: telemetry recorded ($Outcome on $($rec.instanceType), $($rec.totalSeconds)s total)"
+        }
     } catch {
         Log "Job ${JobId}: telemetry not recorded: $($_.Exception.Message)"
     }
@@ -431,6 +551,16 @@ function Get-NextJob {
             aws s3 rm "s3://$Bucket/$($item.k)" --only-show-errors | Out-Null
             continue
         }
+        # The marker's queuedAt is read first (best effort) so the job's diagnostics record can
+        # say how long it waited - once the marker is deleted that number is gone for good.
+        $script:QueuedAt = $null
+        try {
+            $markerRaw = aws s3 cp "s3://$Bucket/$($item.k)" - --no-progress 2>$null
+            if ($markerRaw) {
+                $marker = ($markerRaw -join "`n") | ConvertFrom-Json
+                if ($marker -and $marker.queuedAt) { $script:QueuedAt = "$($marker.queuedAt)" }
+            }
+        } catch { }
         # Claim = delete the queue marker; S3 delete is atomic enough for a single worker.
         aws s3 rm "s3://$Bucket/$($item.k)" --only-show-errors | Out-Null
         if ($LASTEXITCODE -eq 0) { return $id }
@@ -1971,6 +2101,7 @@ function Publish-Artifact($JobId, $OutDir, $Name, $Epsg) {
     if (-not (Test-Path $src)) { return $false }
     if ($script:Delivered | Where-Object { $_.artifact -eq $Name }) { return $true }  # already gone up
     try {
+        $deliverStarted = Get-Date
         # GeoTIFFs are optimized first so the app imports them with a file copy rather than
         # minutes of local conversion. The GLB has no equivalent step.
         $send = $Name
@@ -1991,6 +2122,8 @@ function Publish-Artifact($JobId, $OutDir, $Name, $Epsg) {
         $script:Delivered += @{ artifact = $Name; file = $send; bytes = $bytes
                                 at = (Get-Date).ToUniversalTime().ToString('o') }
         Add-Report "delivered-$Name" @{ file = $send; bytes = $bytes }
+        # Optimize + send, per artefact; summed across artefacts by Save-JobTelemetry.
+        Add-Report 'phase-done-delivering' @{ seconds = [int]((Get-Date) - $deliverStarted).TotalSeconds; artifact = $Name }
         Log "Job ${JobId}: delivered $send ($mb MB) - Smart Drone can import it now"
         Write-Status $JobId 'delivering' "$Name is on its way into Smart Drone" 1
         return $true
@@ -3037,6 +3170,7 @@ function Invoke-Job($JobId) {
         if ($tooTight) { throw $tooTight }
 
         Write-Status $JobId 'downloading' 'Fetching your photos onto the GPU...' 0 -StageIndex 1
+        $fetchStarted = Get-Date   # the fetch is timed as a stage of its own for the diagnostics feed
         # New manifests list content-addressed keys (photolib/<hash>) — fetch each by key under
         # its original name. Legacy manifests fall back to the jobs/<id>/photos sync.
         if ($manifest -and $manifest.photos) {
@@ -3144,18 +3278,34 @@ function Invoke-Job($JobId) {
         $count = (Get-ChildItem $photoDir -File).Count
         Log "Job ${JobId}: $count photos downloaded"
         Add-Report 'photos-downloaded' @{ count = $count }
+        # phase-done-<stage> is the shape Save-JobTelemetry sums into stageSeconds, so every
+        # non-RealityScan step (fetch, optimize, ground surface, upload, delivery) reports the
+        # same way the render phases do and the feed sees the whole job, not just the render.
+        Add-Report 'phase-done-downloading' @{ seconds = [int]((Get-Date) - $fetchStarted).TotalSeconds; count = $count }
         if ($count -eq 0) { throw 'No photos found for this job' }
-        if (Test-Cancelled $JobId) { Write-Status $JobId 'cancelled' 'Cancelled before processing'; return }
+        if (Test-Cancelled $JobId) {
+            Write-Status $JobId 'cancelled' 'Cancelled before processing'
+            # A cancelled job is still a job that happened: recorded so the admin view can see
+            # who stopped what, and how far it had got.
+            Save-JobTelemetry $JobId $depth $count $false 'cancelled' $null $manifest
+            return
+        }
 
         Write-Status $JobId 'aligning' "Starting RealityScan on $count photos..." 0
         $completed = Invoke-RealityScan $JobId $photoDir $outDir $epsg $depth $outputs $meshDetail
-        if (-not $completed) { Write-Status $JobId 'cancelled' 'Cancelled during processing'; return }
+        if (-not $completed) {
+            Write-Status $JobId 'cancelled' 'Cancelled during processing'
+            Save-JobTelemetry $JobId $depth $count $false 'cancelled' $null $manifest
+            return
+        }
 
         # Optimise anything the pipelined delivery did not already handle (a render that failed
         # its early upload, or an output no phase declared). Files already delivered are skipped
         # inside Publish-Artifact, so this is a safety net rather than a second pass.
         $script:StageIndex++
+        $optimizeStarted = Get-Date
         Optimize-GeoTiffs $JobId $outDir $epsg
+        Add-Report 'phase-done-optimizing' @{ seconds = [int]((Get-Date) - $optimizeStarted).TotalSeconds }
 
         # Derive the bare-earth ground surface from the DSM (RealityScan's own DTM option costs
         # far more time inside the ortho step than this does out here).
@@ -3165,7 +3315,9 @@ function Invoke-Job($JobId) {
         # it. Deriving it regardless would add minutes to every standard job for an output
         # nothing at that level uses.
         if ($want.dem) {
+            $demStarted = Get-Date
             Build-Dem $JobId $outDir
+            Add-Report 'phase-done-dem' @{ seconds = [int]((Get-Date) - $demStarted).TotalSeconds }
             # Last rung of the ladder, and the last thing the app is waiting on.
             Publish-Artifact $JobId $outDir 'dem.tif' $epsg | Out-Null
         }
@@ -3189,12 +3341,16 @@ function Invoke-Job($JobId) {
         # here, and again when the app dutifully downloaded the lot and appeared to hang on
         # "Downloading results (dsm.tif)". The .rsproj and the region/projection files stay -
         # they are kilobytes and they are what makes a job reproducible.
+        $uploadStarted = Get-Date
         aws s3 sync $outDir "s3://$Bucket/jobs/$JobId/results" --only-show-errors --exclude 'job/*' --exclude '*.autosave.new'
         if ($LASTEXITCODE -ne 0) { throw 'Result upload to S3 failed' }
+        # After Save-Report by necessity (the report is part of what was just uploaded), so this
+        # entry reaches the diagnostics feed but not job-report.json.
+        Add-Report 'phase-done-uploading' @{ seconds = [int]((Get-Date) - $uploadStarted).TotalSeconds }
 
         $outputs = $produced | ForEach-Object { @{ name = $_.Name; bytes = $_.Length } }
         Write-Status $JobId 'done' 'Complete' 1 $outputs
-        Save-JobTelemetry $JobId $depth $count $true
+        Save-JobTelemetry $JobId $depth $count $true 'done' $null $manifest
         Log "Job ${JobId}: done ($($produced.Count) files)"
     } catch {
         $msg = $_.Exception.Message
@@ -3210,7 +3366,7 @@ function Invoke-Job($JobId) {
         # exactly the ones missing from the history. $count is not in scope on every failure
         # path (a job can die before the photos are counted), so fall back to the manifest.
         $failPhotos = if ($count) { $count } elseif ($manifest -and $manifest.photoCount) { $manifest.photoCount } else { 0 }
-        Save-JobTelemetry $JobId $depth $failPhotos $false
+        Save-JobTelemetry $JobId $depth $failPhotos $false 'error' $msg $manifest
     } finally {
         # Local job files are scratch; S3 keeps the originals + results. This runs on EVERY exit
         # — finished, failed, or cancelled — and now takes RealityScan's cache with it. A
@@ -3460,6 +3616,8 @@ Clear-OldJobDirs
 Log "Worker started (script $ScriptVersion, bucket $Bucket, session $SessionId, workDir $WorkDir [$(Get-FreeGB $WorkDir) GB free, C: $(Get-FreeGB 'C:\') GB free], RealityScan cache $RsTempDir, poll ${PollSeconds}s, idle shutdown ${IdleShutdownMinutes}m)"
 Sync-SettingsFiles
 Restore-AgentChannel
+# First entry in this boot's timeline for the admin diagnostics feed (see Save-InstanceEvent).
+Save-InstanceEvent 'boot'
 if ($SessionId -eq 0) {
     Log "WARNING: this worker is running in Windows session 0 (non-interactive). RealityScan is a GPU/GUI application and will HANG there with no window and no GPU. Run fix-session.ps1 to switch the task to an interactive logon session."
 }
@@ -3470,6 +3628,7 @@ while ($true) {
         if ($jobId) {
             Log "Claimed job $jobId"
             Invoke-Job $jobId
+            $script:JobsRun = [int]$script:JobsRun + 1
             $lastWork = Get-Date
             $script:RdpHoldLogged = $false
             Restore-AgentChannel   # a long render is plenty of time for the channel to die
@@ -3509,6 +3668,8 @@ while ($true) {
                     $why = if ($rdpActive) { "idle $([int]$idleMin) min (past the ${RdpGraceMinutes}m Remote Desktop grace)" } else { "idle $([int]$idleMin) min" }
                     Rescue-UnuploadedOutputs
                     Log "Shutting down to stop billing - $why"
+                    # Last entry in this boot's timeline: why it stopped, and what it did.
+                    Save-InstanceEvent 'shutdown' ([ordered]@{ why = $why; idleMinutes = [int]$idleMin; jobsRun = [int]$script:JobsRun })
                     Stop-Computer -Force
                     exit
                 }
@@ -3527,6 +3688,11 @@ while ($true) {
         if ($AutoShutdownOn -and $script:LoopErrors -ge 40) {
             Log 'Forty consecutive loop errors - this worker cannot work or judge idleness. Shutting down to stop billing.'
             try { Rescue-UnuploadedOutputs } catch { }
+            # Guarded twice over: this runs inside the catch, and a throw here would skip the
+            # shutdown the whole block exists to guarantee.
+            try {
+                Save-InstanceEvent 'shutdown' ([ordered]@{ why = 'forty consecutive loop errors'; idleMinutes = [int]((Get-Date) - $lastWork).TotalMinutes; jobsRun = [int]$script:JobsRun })
+            } catch { }
             Stop-Computer -Force
             exit
         }
