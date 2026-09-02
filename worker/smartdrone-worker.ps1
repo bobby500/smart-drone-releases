@@ -17,7 +17,7 @@
 # Config: C:\SmartDroneWorker\config.json (written by install-worker.ps1).
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-09-01.100'  # logged at startup — proves which script revision is running
+$ScriptVersion = '2026-09-02.101'  # logged at startup — proves which script revision is running
 $ConfigDir = 'C:\SmartDroneWorker'
 $Config = Get-Content (Join-Path $ConfigDir 'config.json') -Raw | ConvertFrom-Json
 $LogFile = Join-Path $ConfigDir 'worker.log'
@@ -411,7 +411,11 @@ function Save-InstanceEvent($Kind, $Extra = $null) {
             instanceType  = Get-InstanceType
             scriptVersion = $ScriptVersion
         }
-        if ($Kind -eq 'boot') { $rec.bootedAt = $now.ToString('o') } else { $rec.shutdownAt = $now.ToString('o') }
+        # Every kind carries `at`; boot/shutdown keep their original field names so the existing
+        # readers of this feed do not have to change.
+        $rec.at = $now.ToString('o')
+        if ($Kind -eq 'boot') { $rec.bootedAt = $now.ToString('o') }
+        elseif ($Kind -eq 'shutdown') { $rec.shutdownAt = $now.ToString('o') }
         if ($Extra) { foreach ($k in @($Extra.Keys)) { $rec[$k] = $Extra[$k] } }
         # Filesystem-safe stamp (no colons - the key doubles as a sortable filename when the feed
         # is mirrored to disk on the admin side). Backslashes make T and Z literal for .NET.
@@ -1840,6 +1844,154 @@ function Get-RsCpuSeconds($Proc) {
     try { $Proc.Refresh(); return $Proc.TotalProcessorTime.TotalSeconds } catch { return -1.0 }
 }
 
+# ---- CAN THIS MACHINE RENDER AT ALL? ---------------------------------------------------------
+#
+# The app re-fits this box to a different instance type on almost every job start, walking its
+# ladder from the top (g5 -> g6 -> g4dn) as capacity allows. An NVIDIA driver installed for one
+# GPU family does not bind to another, so a routine resize can leave a perfectly healthy machine
+# with no usable GPU - and RealityScan's answer to that is a modal error box nobody can see,
+# which the jam watchdog then reports two minutes later as "wedged". That cost an afternoon on
+# 1 Sep 2026 (nvidia-smi: "couldn't communicate with the NVIDIA driver" on a box that had just
+# been moved onto a T4).
+#
+# So the worker now asks the question ITSELF, at startup and again before every job:
+#   1. probe the GPU,
+#   2. if it is missing, INSTALL THE DRIVER and reboot - the box repairs itself,
+#   3. and if that cannot be done, fail claimed jobs IMMEDIATELY with a sentence the operator
+#      can act on, instead of jamming behind an invisible dialog.
+$script:GpuState = $null            # last Test-GpuReady result, refreshed at startup and per job
+$GpuRepairStateFile = Join-Path $ConfigDir 'gpu-repair.json'
+$GpuRepairMaxAttempts = 2           # per instance type: a driver that will not take twice is not
+                                    # going to take on the tenth reboot, and a loop bills all night
+
+# Distinct from Get-GpuBusy below, which asks "is the GPU doing anything right now" and treats a
+# missing driver as merely idle. This asks "is there a usable GPU here", where the answer decides
+# whether the machine can work at all.
+function Test-GpuReady {
+    $result = [ordered]@{ ok = $false; name = ''; driver = ''; reason = '' }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1
+        $rc = $LASTEXITCODE
+        $text = ($out | Out-String).Trim()
+        $failed = $text -match "has failed|couldn't communicate|not recognized|No devices were found|NVIDIA-SMI has failed"
+        if ($rc -eq 0 -and $text -and -not $failed) {
+            $first = (($text -split "`n")[0]).Trim()
+            $parts = $first -split ','
+            $result.ok = $true
+            $result.name = $parts[0].Trim()
+            if ($parts.Count -gt 1) { $result.driver = $parts[1].Trim() }
+        } else {
+            $result.reason = if ($text) { (($text -split "`n")[0]).Trim() } else { "nvidia-smi exited $rc with no output" }
+        }
+    } catch {
+        # nvidia-smi missing from PATH entirely lands here - no driver package at all.
+        $result.reason = $_.Exception.Message
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $result
+}
+
+function Get-GpuRepairAttempts($Key) {
+    try {
+        if (-not (Test-Path $GpuRepairStateFile)) { return 0 }
+        $d = Get-Content $GpuRepairStateFile -Raw | ConvertFrom-Json
+        $v = $d.$Key
+        if ($v) { return [int]$v }
+        return 0
+    } catch { return 0 }
+}
+
+function Set-GpuRepairAttempts($Key, $Count) {
+    try {
+        $d = @{}
+        if (Test-Path $GpuRepairStateFile) {
+            $existing = Get-Content $GpuRepairStateFile -Raw | ConvertFrom-Json
+            foreach ($p in $existing.PSObject.Properties) { $d[$p.Name] = $p.Value }
+        }
+        $d[$Key] = $Count
+        [IO.File]::WriteAllText($GpuRepairStateFile, ($d | ConvertTo-Json -Depth 3))
+    } catch { Log "Could not record the GPU repair attempt: $($_.Exception.Message)" }
+}
+
+# Install AWS's current NVIDIA driver package. One driver covers T4, A10G and L4, so a machine
+# that repairs itself once can be moved between families afterwards without breaking again.
+# Returns $true when an installer actually ran, meaning the caller should reboot.
+function Repair-GpuDriver($Reason) {
+    $type = Get-InstanceType
+    $key = "$type"
+    $tries = Get-GpuRepairAttempts $key
+    if ($tries -ge $GpuRepairMaxAttempts) {
+        Log "GPU driver repair already attempted $tries time(s) on $type and the GPU is still missing - not trying again (a human needs to look)."
+        return $false
+    }
+    Set-GpuRepairAttempts $key ($tries + 1)
+    Log "No usable GPU ($Reason). Installing the NVIDIA driver for $type - attempt $($tries + 1) of $GpuRepairMaxAttempts."
+    Save-InstanceEvent 'gpu-repair' ([ordered]@{ reason = "$Reason"; attempt = ($tries + 1); instanceTypeAtRepair = $type })
+    # The script's own temp dir, which lives on the scratch volume when there is one: the driver
+    # package is the better part of a gigabyte, and $env:TEMP is both smaller and (as the tests
+    # found) not guaranteed to be set at all.
+    $base = if ($TempDir) { $TempDir } elseif ($env:TEMP) { $env:TEMP } else { $ConfigDir }
+    $dir = Join-Path $base 'sd-nvidia'
+    try {
+        if (Test-Path $dir) { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        # The bucket is public, so the unsigned read works even where this box's own IAM identity
+        # is scoped to the smartdrone buckets alone; the signed call is the fallback.
+        $rc = Invoke-AwsQuiet s3 cp --recursive s3://ec2-windows-nvidia-drivers/latest/ $dir --region us-east-1 --no-sign-request
+        if ($rc -ne 0) {
+            Log 'Unsigned driver download refused - retrying with this machine''s own credentials.'
+            $rc = Invoke-AwsQuiet s3 cp --recursive s3://ec2-windows-nvidia-drivers/latest/ $dir --region us-east-1
+        }
+        if ($rc -ne 0) { Log "Could not download the NVIDIA driver (aws exit $rc)."; return $false }
+        # The driver package is by far the biggest file in there; the rest is readmes.
+        $exe = Get-ChildItem $dir -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending | Select-Object -First 1
+        if (-not $exe) { Log 'The driver download contained no installer.'; return $false }
+        Log "Running $($exe.Name) silently ($([int]($exe.Length / 1MB)) MB) - this takes a few minutes."
+        # -clean matters on a family switch: it removes the settings of the driver that was
+        # installed for the OTHER card, which is what stops the new one binding.
+        $proc = Start-Process -FilePath $exe.FullName -ArgumentList '-s', '-noreboot', '-clean' -PassThru
+        if (-not $proc.WaitForExit(20 * 60 * 1000)) {
+            Log 'The NVIDIA installer did not finish within 20 minutes - abandoning it.'
+            try { $proc | Stop-Process -Force } catch { }
+            return $false
+        }
+        Log "NVIDIA installer finished (exit $($proc.ExitCode))."
+        return $true
+    } catch {
+        Log "GPU driver repair failed: $($_.Exception.Message)"
+        return $false
+    } finally {
+        try { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+# Startup and per-job gate. Probes, repairs once if it can, and reboots into the repaired driver.
+# Returns the state so callers can fail a job with a reason rather than guessing.
+function Confirm-GpuOrRepair([switch]$AllowReboot) {
+    $state = Test-GpuReady
+    $script:GpuState = $state
+    if ($state.ok) {
+        # A machine that needed repairing before and is healthy now starts its count again, so a
+        # future family switch gets its own full allowance.
+        try { Set-GpuRepairAttempts (Get-InstanceType) 0 } catch { }
+        return $state
+    }
+    Log "GPU CHECK FAILED: $($state.reason)"
+    Save-InstanceEvent 'gpu-fault' ([ordered]@{ reason = "$($state.reason)" })
+    if (-not $AllowReboot) { return $state }
+    if (Repair-GpuDriver $state.reason) {
+        Log 'Rebooting to bring the new NVIDIA driver up. The worker restarts with the machine.'
+        Save-InstanceEvent 'shutdown' ([ordered]@{ why = 'reboot after installing the NVIDIA driver'; idleMinutes = 0; jobsRun = [int]$script:JobsRun })
+        try { Restart-Computer -Force } catch { Log "Reboot refused: $($_.Exception.Message)" }
+        Start-Sleep -Seconds 120   # hold the loop while Windows goes down
+    }
+    return $state
+}
+
 # nvidia-smi utilisation, $true when the GPU is doing anything. Absent driver = $false (the
 # other two signals then decide).
 function Get-GpuBusy {
@@ -2996,6 +3148,20 @@ function Invoke-Job($JobId) {
             $manifestRaw = aws s3 cp "s3://$Bucket/jobs/$JobId/manifest.json" - --no-progress 2>$null
             if ($manifestRaw) { $manifest = $manifestRaw | ConvertFrom-Json }
         } catch { }
+        # NO GPU, NO RENDER - and say so NOW. Without this the job runs all the way to the
+        # RealityScan launch, which puts up "could not find a usable NVIDIA graphics card" on a
+        # desktop nobody is looking at, and the operator sees only a two-minute jam and a wedged
+        # machine. Re-probed per job on purpose: a driver repaired by hand between jobs is picked
+        # up without restarting the worker.
+        $gpu = Confirm-GpuOrRepair
+        if (-not $gpu.ok) {
+            $msg = "This render machine has no working GPU driver, so the job was not started ($($gpu.reason)). The machine repairs its own driver on the next restart; if this keeps happening its NVIDIA driver needs reinstalling."
+            Log "Job ${JobId}: refused - $msg"
+            Add-Report 'gpu-unavailable' @{ reason = "$($gpu.reason)" }
+            Write-Status $JobId 'error' $msg
+            Save-JobTelemetry $JobId 'unknown' 0 $false 'error' $msg $manifest
+            return
+        }
         $epsg = if ($manifest -and $manifest.params -and $manifest.params.exportEpsg) { $manifest.params.exportEpsg } else { 2193 }
         # Resolved HERE, in the function that uses it for the DEM decision and the telemetry, and
         # passed down. Reading it inside Invoke-RealityScan made it local to that function and
@@ -3618,6 +3784,16 @@ Sync-SettingsFiles
 Restore-AgentChannel
 # First entry in this boot's timeline for the admin diagnostics feed (see Save-InstanceEvent).
 Save-InstanceEvent 'boot'
+# CAN THIS MACHINE RENDER? Asked before the loop can claim a single job, because a box with no
+# usable GPU cannot do the work and the failure is otherwise invisible until RealityScan is
+# already up and waiting behind a modal error box. A missing driver is installed and the machine
+# reboots into it; see Confirm-GpuOrRepair.
+$gpuState = Confirm-GpuOrRepair -AllowReboot
+if ($gpuState.ok) {
+    Log "GPU ready: $($gpuState.name) (driver $($gpuState.driver))"
+} else {
+    Log "WARNING: this machine has NO USABLE GPU ($($gpuState.reason)). Jobs it claims will be failed immediately with that reason rather than left to hang - its NVIDIA driver needs reinstalling by hand."
+}
 if ($SessionId -eq 0) {
     Log "WARNING: this worker is running in Windows session 0 (non-interactive). RealityScan is a GPU/GUI application and will HANG there with no window and no GPU. Run fix-session.ps1 to switch the task to an interactive logon session."
 }
