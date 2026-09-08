@@ -17,7 +17,7 @@
 # Config: C:\SmartDroneWorker\config.json (written by install-worker.ps1).
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-09-02.101'  # logged at startup — proves which script revision is running
+$ScriptVersion = '2026-09-08.103'  # logged at startup — proves which script revision is running
 $ConfigDir = 'C:\SmartDroneWorker'
 $Config = Get-Content (Join-Path $ConfigDir 'config.json') -Raw | ConvertFrom-Json
 $LogFile = Join-Path $ConfigDir 'worker.log'
@@ -175,6 +175,24 @@ function Write-Status($JobId, $Stage, $Message, $Pct = 0, $Outputs = $null, $Det
     if ($StageCount -le 0) { $StageCount = $script:StageCount }
     if ($StageIndex -gt 0 -and $StageCount -gt 0) { $status.stageIndex = $StageIndex; $status.stageCount = $StageCount }
     if ($script:JobStarted) { $status.elapsedSec = [int]((Get-Date) - $script:JobStarted).TotalSeconds }
+    # WHETHER THIS RENDER IS RUNNING CLEANLY, as two counters the app can act on.
+    #
+    # The worker has always known when a phase jammed and had to be cleared and restarted, and when
+    # it repaired a graphics driver under itself — it just kept that to its own log. The app records
+    # every finished job into its render history and levels all future estimates off the median, so
+    # a job that was fighting the machine was being used as a measurement of how long a good render
+    # takes. One three-and-a-half-hour render of a 60-photo flight (RealityScan crashed with a Mini
+    # Dump; the driver did not match the instance family after a type change) then became a
+    # confident three-and-a-half-hour quote for every 60-photo flight after it.
+    #
+    # phaseRetries counts RealityScan phases this JOB had to restart. gpuRepairs is how many driver
+    # repairs this INSTANCE TYPE has needed and not yet cleared — a machine mid-repair is not a
+    # machine to measure. Either being non-zero makes the app keep the row but leave it out of the
+    # median (see perf.record in photogrammetry.js).
+    $status.phaseRetries = [int]$script:PhaseRetries
+    # Wrapped for the same reason the S3 write below is: a status update is a progress report, not
+    # the work, and a probe that hiccups must never be able to fail a render.
+    try { $status.gpuRepairs = [int](Get-GpuRepairAttempts (Get-InstanceType)) } catch { $status.gpuRepairs = 0 }
     # detail = the interesting tail (RealityScan's own output, error context). The app mirrors it
     # into its Troubleshooting timeline, so keep it status.json-sized.
     if ($Detail) { $d = "$Detail"; $status.detail = if ($d.Length -gt 3500) { $d.Substring($d.Length - 3500) } else { $d } }
@@ -646,8 +664,16 @@ function Square-ReconstructionRegion($JobId, $Proj) {
     $crsArgs = Get-OrthoSetArgs
     try {
         Remove-Item $box -Force -ErrorAction SilentlyContinue
+        # The same courtesy every real phase gets at Invoke-RsPhase: sweep stale Epic helpers
+        # BEFORE launching. Squaring runs seconds after the aligning phase's RealityScan exits,
+        # which is precisely when its launcher helpers are still mid-shutdown and can deadlock the
+        # next start - the freeze of 8 Sep 2026 sat here for ninety minutes.
+        Clear-EpicJam $JobId 'leftovers before squaring' | Out-Null
+        # 12 minutes, not the default: each of these launches only loads the project, touches the
+        # region, and quits. On a healthy box that is seconds; past twelve minutes it is a jam, and
+        # the fallback (straighten the ortho afterwards) is the pre-v61 behaviour, always safe.
         $rc = Invoke-ToolWithBeat $JobId 'squaring' 'Squaring the mapping area to north...' $exe `
-            (@('-headless', '-load', $Proj) + $crsArgs + @('-exportReconstructionRegion', $box, '-quit')) 0.3
+            (@('-headless', '-load', $Proj) + $crsArgs + @('-exportReconstructionRegion', $box, '-quit')) 0.3 10 12
         if (-not (Test-Path $box)) { Log "Job ${JobId}: could not export the reconstruction region (exit $rc) - the ortho will be straightened afterwards instead"; return $false }
 
         [xml]$x = Get-Content $box -Raw
@@ -659,7 +685,7 @@ function Square-ReconstructionRegion($JobId, $Proj) {
         Log "Job ${JobId}: region rotation [$before] -> [0 0 0]"
 
         $rc2 = Invoke-ToolWithBeat $JobId 'squaring' 'Applying the squared mapping area...' $exe `
-            (@('-headless', '-load', $Proj) + $crsArgs + @('-setReconstructionRegion', $box, '-save', $Proj, '-quit')) 0.6
+            (@('-headless', '-load', $Proj) + $crsArgs + @('-setReconstructionRegion', $box, '-save', $Proj, '-quit')) 0.6 10 12
         if ($rc2 -ne 0) { Log "Job ${JobId}: could not apply the squared region (exit $rc2) - continuing with the fitted one"; return $false }
         Log "Job ${JobId}: reconstruction region squared to north - the ortho should need no warp"
         Add-Report 'region-squared' @{ before = $before }
@@ -1203,7 +1229,7 @@ function Get-RsPhases($Depth, $PhotoDir, $OutDir, $Proj, $Minimal = $false, $Wan
 # before calling a worker dead, and why 50 minutes of GPU time went to a job that had been frozen
 # for most of it. Beating from THIS loop is what makes a fast timeout safe: the beat proves the
 # worker's own main thread is running, which a separate heartbeat process could not.
-function Invoke-ToolWithBeat($JobId, $Stage, $Message, $Exe, $ToolArgs, $Pct = 0.5, $BeatSeconds = 10) {
+function Invoke-ToolWithBeat($JobId, $Stage, $Message, $Exe, $ToolArgs, $Pct = 0.5, $BeatSeconds = 10, $MaxMinutes = 180) {
     # System.Diagnostics.Process, NOT Start-Process -PassThru.
     #
     # Start-Process returns a Process object whose ExitCode can stay EMPTY even after
@@ -1236,10 +1262,41 @@ function Invoke-ToolWithBeat($JobId, $Stage, $Message, $Exe, $ToolArgs, $Pct = 0
     # Async reads keep both pipes drained while we beat.
     $so = $p.StandardOutput.ReadToEndAsync()
     $se = $p.StandardError.ReadToEndAsync()
+    # THE CAP (field, 8 Sep 2026: "squaring to the north... definitely frozen. It's been there for
+    # ninety minutes"). This loop used to wait forever — and every beat re-published status.json,
+    # so the worker actively reported itself healthy while RealityScan sat behind a modal dialog.
+    # All the jam defences (Clear-EpicJam, the dialog whitelist, the stall watchdog) live in the
+    # PHASE machinery; the squaring step launches RealityScan through here instead and got none of
+    # them. Nothing this wrapper runs is legitimately unbounded, so no call may wait forever:
+    # on expiry the tool is killed, the caller gets 124 (GNU timeout's convention), and every
+    # Invoke-ToolWithBeat caller already treats a non-zero exit as "fall back, do not fail the job".
+    $isRs = [System.IO.Path]::GetFileNameWithoutExtension($Exe) -match 'RealityScan|RealityCapture'
+    $dialogLogged = ''
     $t0 = Get-Date
     while (-not $p.WaitForExit($BeatSeconds * 1000)) {
         $mins = [int]((Get-Date) - $t0).TotalMinutes
         Write-Status $JobId $Stage "$Message$(if ($mins -ge 1) { " - $mins min in" })" $Pct
+        # If this is RealityScan and it has put up a window, say WHAT it says. The ninety-minute
+        # freeze taught us nothing because nobody could see the dialog; this line is the diagnosis
+        # arriving in the log while the jam is still happening.
+        if ($isRs -and $mins -ge 2) {
+            $txt = (Get-RsDialogText) -replace "`n", ' | '
+            if ($txt -and $txt -ne $dialogLogged) {
+                $dialogLogged = $txt
+                Log "Job ${JobId}: RealityScan has a window up during '$Stage': $txt"
+            }
+        }
+        if (((Get-Date) - $t0).TotalMinutes -ge $MaxMinutes) {
+            Log "Job ${JobId}: '$Stage' still running after $MaxMinutes min - killing $([System.IO.Path]::GetFileName($Exe)) (pid $($p.Id)) and moving on$(if ($dialogLogged) { ". Last window seen: $dialogLogged" })"
+            # /T takes the children too - RealityScan drags Epic helpers along, and an orphaned
+            # helper is exactly the lock Clear-EpicJam exists to break.
+            try { & taskkill /PID $p.Id /T /F 2>$null | Out-Null } catch { }
+            try { if (-not $p.WaitForExit(15000)) { $p.Kill() } } catch { }
+            if ($isRs) { Clear-EpicJam $JobId "killed a wedged '$Stage' tool" | Out-Null }
+            Add-Report 'tool-timeout' @{ stage = $Stage; exe = [System.IO.Path]::GetFileName($Exe); minutes = $MaxMinutes; dialog = $dialogLogged }
+            Remove-Item $out -Force -ErrorAction SilentlyContinue
+            return 124
+        }
     }
     $p.WaitForExit()
     $code = $p.ExitCode
@@ -1463,6 +1520,9 @@ function Invoke-RsPhase($JobId, $Phase, $StageIndex, $StageCount) {
             if ($startupJam -and $cpu -lt 2 -and -not $script:EpicRetryUsed) {
                 $script:EpicRetryUsed = $true
                 if (Clear-EpicJam $JobId 'startup jam with zero CPU') {
+                    # Counted, not just logged: this is the signal the app uses to keep a restarted
+                    # render out of the history it levels future estimates from. See Write-Status.
+                    $script:PhaseRetries = [int]$script:PhaseRetries + 1
                     Log "Job ${JobId}: retrying $($Phase.stage) once after clearing the Epic lock"
                     Write-Status $JobId $Phase.stage 'Clearing a stuck RealityScan and retrying...' 0.05
                     return (Invoke-RsPhase $JobId $Phase $StageIndex $StageCount)
@@ -1473,7 +1533,7 @@ function Invoke-RsPhase($JobId, $Phase, $StageIndex, $StageCount) {
         }
         # Within-phase progress: the learned duration for this phase on this machine, so the bar
         # advances sensibly instead of pretending to know the whole job's length.
-        $expect = Get-PhaseExpectation $Phase.stage
+        $expect = Get-StageExpectation $Phase.stage
         $pct = if ($expect -gt 0) { [Math]::Min(0.95, ((Get-Date) - $started).TotalSeconds / $expect) } else { [Math]::Min(0.95, $mins / 20.0) }
         # Show RealityScan's OWN progress line when it has one - it beats our elapsed-time guess.
         # Same pass clears any harmless pop-up, so the ortho export's coordinate-system warning
@@ -2003,8 +2063,9 @@ function Get-GpuBusy {
     } catch { return $false }
 }
 
-# Per-phase durations learned on THIS machine (photo-count independent for now) — they drive the
-# in-phase progress and give the app a sane per-stage ETA.
+# Per-phase durations learned on THIS machine — they drive the in-phase progress and give the app a
+# sane per-stage ETA. They are NO LONGER photo-count independent: what is stored is a rate per unit
+# of whatever drives the stage, with the unit recorded beside it (see Save-PhaseExpectation).
 # Seed durations, in seconds, for a stage this machine has never run. Measured on a real
 # 97-photo flight rather than guessed, so the very first job's bar is already roughly right and
 # the smoothing in Save-PhaseExpectation only has to correct, not discover.
@@ -2023,38 +2084,179 @@ $StageSeed = @{
     optimizing  = 150; uploading = 240
 }
 
+# WHAT EACH STAGE'S TIME IS DRIVEN BY. Mirrors STAGE_DRIVER in src/main/cloud/renderCost.js and is
+# held to it by test/workerSeeds.test.js — the app quotes a time from that table before the render
+# and the bar is weighted by this one during it, so a stage tagged differently on the two sides
+# would move the bar for a reason the quote did not.
+#
+# 'photos' — work done once per image (a download, a feature match, a depth map).
+# 'area'   — work done once per output pixel: the raster exports, the COG conversion, the upload.
+$StageDriver = @{
+    downloading = 'photos'; aligning = 'photos'; model = 'photos'; texturing = 'photos'
+    ortho       = 'area';   model3d  = 'area';   dsm   = 'area';   dem       = 'area'
+    optimizing  = 'area';   uploading = 'area'
+}
+
+# The SIZE the seeds above were measured at: 97 photos, and RealityScan's fixed default grid of
+# 26738 x 46675 = 1248 Mpx over that job's 290.9 x 511.1 m region (worker/README.md). A seed is a
+# duration at a size, and it is useless without the size — that is the whole bug this replaces.
+$StageSeedUnits = @{ photos = 97; mpx = 1248 }
+
+# THE ORTHO AND DSM PHASES ARE NOT A FLAT RATE, and pretending they were is what makes a learned
+# per-megapixel number dangerous. Both are one -calculateOrthoProjection pass plus an export, and
+# the projection is the bulk of it: fitting the two rasters on record (1248 Mpx at 440/579 s and
+# 441 Mpx at 282/331 s) gives intercepts of 195.6 s and 195.4 s — the same number twice, which is
+# what a shared projection looks like. Held here so the plan for a Low-tier job does not weight the
+# ortho at almost nothing; the app carries the identical figures in renderCost.js.
+$StageProjectionSec = 196
+$StageExportSecPerMpx = @{ ortho = 0.196; dsm = 0.307 }
+
+# How big THIS job is, in each driver's own units. Zero means "not known yet" and the caller falls
+# back to the seed rather than inventing a size.
+#
+# Photos: the count actually on disk after the fetch. Megapixels: the grid Build-JobOrtho computed
+# for this job, which is what the exports and the COG conversion really cost. Before alignment has
+# run there is no grid, which is exactly why Set-StagePlan is called a second time once there is.
+function Get-StageUnits($Stage) {
+    $driver = if ($StageDriver.ContainsKey($Stage)) { $StageDriver[$Stage] } else { 'photos' }
+    if ($driver -eq 'photos') {
+        if ($script:JobPhotoCount -gt 0) { return [double]$script:JobPhotoCount } else { return 0.0 }
+    }
+    if ($script:PlannedGridRows -gt 0 -and $script:PlannedGridCols -gt 0) {
+        return ([double]$script:PlannedGridRows * [double]$script:PlannedGridCols) / 1000000.0
+    }
+    return 0.0
+}
+
+function Get-StageDriverName($Stage) {
+    if ($StageDriver.ContainsKey($Stage) -and $StageDriver[$Stage] -eq 'area') { return 'mpx' }
+    return 'photos'
+}
+
+# What this stage is expected to cost on THIS job, in seconds.
+#
+# Learned per-unit rate first, then the seed rate at this job's size, then the bare seed. The
+# raster phases skip the learned rate entirely — see Save-PhaseExpectation.
+function Get-StageExpectation($Stage) {
+    $units = Get-StageUnits $Stage
+    $seed = if ($StageSeed.ContainsKey($Stage)) { [double]$StageSeed[$Stage] } else { 180.0 }
+    if ($Stage -eq 'ortho' -or $Stage -eq 'dsm') {
+        if ($units -le 0) { return $seed }
+        return $StageProjectionSec + ($StageExportSecPerMpx[$Stage] * $units)
+    }
+    if ($units -gt 0) {
+        $rate = Get-PhaseRate $Stage
+        if ($rate -gt 0) { return $rate * $units }
+        $refUnits = [double]$StageSeedUnits[(Get-StageDriverName $Stage)]
+        if ($refUnits -gt 0) { return ($seed / $refUnits) * $units }
+    }
+    return $seed
+}
+
 # The bar's weights. The app cannot know how long a stage takes - only this machine does, and it
 # has been recording exactly that in phase-times.json all along. Publishing the plan turns the
 # progress bar from a fixed guess (which put the photo upload at half the bar and squeezed the
 # whole render into the last tenth) into something proportional to real measured time.
+#
+# THESE NUMBERS ONLY EVER SET PROPORTIONS. photogrammetry.js planSpans divides every expectSec by
+# the total, so nothing here reaches the operator as a duration and no absolute error in this file
+# can produce a wrong quote. What it CAN do is distort the shape of the bar, and it did: a 600-photo
+# job left 'model' at ~4300 s in the file, the next 60-photo job gave the mesh most of the bar, the
+# within-phase percentage never got past 0.10 before the stage ended, and the bar lurched at every
+# boundary. That distortion also drives the app's live "about X left", which is why a render could
+# feel like it was taking forever regardless of what it had been quoted.
 function Set-StagePlan($Stages) {
     $plan = @()
     foreach ($s in $Stages) {
-        $secs = Get-PhaseExpectation $s
+        $secs = Get-StageExpectation $s
         if ($secs -le 0) { $secs = if ($StageSeed.ContainsKey($s)) { $StageSeed[$s] } else { 180 } }
-        $plan += @{ stage = $s; expectSec = [int]$secs }
+        $plan += @{ stage = $s; expectSec = [int][Math]::Max(1.0, [double]$secs) }
     }
     $script:StagePlan = $plan
-    Log "Job stage plan: $(($plan | ForEach-Object { "$($_.stage) ~$($_.expectSec)s" }) -join ', ')"
+    Log "Job stage plan ($($script:JobPhotoCount) photos, $([Math]::Round((Get-StageUnits 'ortho'), 1)) Mpx): $(($plan | ForEach-Object { "$($_.stage) ~$($_.expectSec)s" }) -join ', ')"
 }
 
-function Get-PhaseExpectation($Stage) {
+# ---- phase-times.json ---------------------------------------------------------------------------
+#
+# WHAT THIS FILE HOLDS NOW: a RATE PER UNIT, with the unit it was measured in, keyed by instance
+# type. What it held before: a bare number of seconds, smoothed 60/40 across jobs, with nothing
+# recording how big the job was. So a 600-photo render taught this machine numbers that were then
+# applied unchanged to a 60-photo one, and convergence back took about nine same-size renders of
+# paid GPU time. Keying by instance type follows the precedent Get-GpuRepairAttempts already set:
+# this box gets moved between families, and a rate learned on four T4s is not a rate for four A10Gs.
+#
+# A v1 FILE IS NOT CONVERTED, IT IS RETIRED. A v1 number is a duration at an unknown size; dividing
+# it by an assumed 97 photos would manufacture a measurement this repo does not have. It is renamed
+# to phase-times.v1.json (kept, because it is evidence) and learning restarts from the seeds.
+$PhaseTimesFile = Join-Path $ConfigDir 'phase-times.json'
+
+function Read-PhaseTimes {
     try {
-        $f = Join-Path $ConfigDir 'phase-times.json'
-        if (-not (Test-Path $f)) { return 0 }
-        $j = Get-Content $f -Raw | ConvertFrom-Json
-        $v = $j.$Stage
-        if ($v) { return [double]$v } else { return 0 }
-    } catch { return 0 }
+        if (-not (Test-Path $PhaseTimesFile)) { return $null }
+        $j = Get-Content $PhaseTimesFile -Raw | ConvertFrom-Json
+        if (-not $j) { return $null }
+        if (-not $j.v) {
+            $retired = Join-Path $ConfigDir 'phase-times.v1.json'
+            try {
+                Move-Item $PhaseTimesFile $retired -Force
+                Log "phase-times.json was the old size-blind format - kept as phase-times.v1.json and relearning from the seeds. Its numbers are durations at an unknown job size and cannot be converted."
+            } catch { }
+            return $null
+        }
+        return $j
+    } catch { return $null }
 }
+
+# The learned seconds-per-unit for a stage on THIS machine, or 0 when nothing has been learned.
+function Get-PhaseRate($Stage) {
+    try {
+        $j = Read-PhaseTimes
+        if (-not $j) { return 0.0 }
+        $machine = "$(Get-InstanceType)"
+        $byMachine = $j.stages.$machine
+        if (-not $byMachine) { return 0.0 }
+        $entry = $byMachine.$Stage
+        if (-not $entry) { return 0.0 }
+        # A rate is only usable against the same kind of unit it was measured in.
+        if ("$($entry.driver)" -ne (Get-StageDriverName $Stage)) { return 0.0 }
+        $v = [double]$entry.perUnit
+        if ($v -gt 0) { return $v } else { return 0.0 }
+    } catch { return 0.0 }
+}
+
+# Learn from a finished stage. $Seconds is its wall time; the size is read off the job.
+#
+# THE RASTER PHASES DO NOT LEARN, deliberately. The ortho phase's wall time is a projection plus one
+# or two exports (the DSM is chained onto it), so a single seconds-per-megapixel number taken off it
+# is not a measurement of anything: it would be learned on a job that exported two rasters and then
+# spent on a job that exports one. The fitted two-term model in Get-StageExpectation is better than
+# a rate fitted to a mixture, and the app quotes the operator from the same fit.
 function Save-PhaseExpectation($Stage, $Seconds) {
     try {
-        $f = Join-Path $ConfigDir 'phase-times.json'
-        $j = if (Test-Path $f) { Get-Content $f -Raw | ConvertFrom-Json } else { [PSCustomObject]@{} }
-        $prev = if ($j.$Stage) { [double]$j.$Stage } else { 0 }
-        $next = if ($prev -gt 0) { ($prev * 0.6) + ($Seconds * 0.4) } else { $Seconds }  # smoothed
-        $j | Add-Member -NotePropertyName $Stage -NotePropertyValue $next -Force
-        [IO.File]::WriteAllText($f, ($j | ConvertTo-Json -Depth 3))
+        if ($Stage -eq 'ortho' -or $Stage -eq 'dsm') { return }
+        if (-not ($Seconds -gt 0)) { return }
+        $units = Get-StageUnits $Stage
+        if (-not ($units -gt 0)) { return }   # no size recorded means no measurement to keep
+        $driver = Get-StageDriverName $Stage
+        $perUnit = [double]$Seconds / $units
+        $machine = "$(Get-InstanceType)"
+        $j = Read-PhaseTimes
+        if (-not $j) { $j = [PSCustomObject]@{ v = 2; stages = [PSCustomObject]@{} } }
+        if (-not $j.stages) { $j | Add-Member -NotePropertyName stages -NotePropertyValue ([PSCustomObject]@{}) -Force }
+        if (-not $j.stages.$machine) { $j.stages | Add-Member -NotePropertyName $machine -NotePropertyValue ([PSCustomObject]@{}) -Force }
+        $prevEntry = $j.stages.$machine.$Stage
+        $prev = 0.0
+        if ($prevEntry -and "$($prevEntry.driver)" -eq $driver) { $prev = [double]$prevEntry.perUnit }
+        $n = 0
+        if ($prevEntry -and $prevEntry.n) { $n = [int]$prevEntry.n }
+        # Smoothed on the RATE, not on the seconds. Smoothing seconds across two different job sizes
+        # averages two answers to two different questions.
+        $next = if ($prev -gt 0) { ($prev * 0.6) + ($perUnit * 0.4) } else { $perUnit }
+        $j.stages.$machine | Add-Member -NotePropertyName $Stage -NotePropertyValue ([PSCustomObject]@{
+            driver = $driver; perUnit = $next; n = ($n + 1)
+            lastSec = [int]$Seconds; lastUnits = [Math]::Round($units, 3)
+        }) -Force
+        [IO.File]::WriteAllText($PhaseTimesFile, ($j | ConvertTo-Json -Depth 6))
     } catch { }
 }
 
@@ -2150,6 +2352,13 @@ function Invoke-RealityScan($JobId, $PhotoDir, $OutDir, $Epsg, $Depth, $Outputs 
                     # out, so fail the job with the plain reason (the strip wiring will route
                     # these to Build-StripPlan instead of throwing, once verified + enabled).
                     if ($script:OrthoRefuseReason) { throw $script:OrthoRefuseReason }
+                    # RE-PLAN NOW THE GRID IS REAL. The first plan was built before alignment, when
+                    # the only size known was the photo count — so every raster stage was weighted
+                    # off the seed grid whatever tier the operator picked. Build-JobOrtho has just
+                    # computed the grid this job will actually export, and the four longest stages
+                    # (texturing, ortho, dsm, optimizing) have not run yet, so a re-plan here is
+                    # both cheap and in time to matter.
+                    Set-StagePlan $planStages
                     # The texture is what the ortho renders FROM, so its budget is sized to the
                     # GSD the raster will ACTUALLY use — Build-JobOrtho may have swapped an
                     # implausible app figure for the photo-supported one, and budgeting off the
@@ -3131,6 +3340,7 @@ function Invoke-Job($JobId) {
     $script:StageCount = 0   # real total lands once the phase list for this depth is known
     $script:LastCliDetail = $null
     $script:EpicRetryUsed = $false  # the Epic-lock retry is once PER JOB, not once per worker life
+    $script:PhaseRetries = 0        # and so is the count of them the app reads off status.json
     $script:Delivered = @()         # artefacts already sent ahead (see Publish-Artifact)
     $script:StagePlan = $null       # filled once the depth's phase list is known
     $script:Report = [ordered]@{
@@ -3442,12 +3652,22 @@ function Invoke-Job($JobId) {
             }
         }
         $count = (Get-ChildItem $photoDir -File).Count
+        # The count ON DISK, not the manifest's. This is what every photo-driven stage is really
+        # sized by, and it is the denominator the learned rates are stored against — a manifest
+        # that over-counts (a photo that failed to upload) would otherwise teach a rate that is
+        # quietly too low for ever.
+        $script:JobPhotoCount = [int]$count
         Log "Job ${JobId}: $count photos downloaded"
         Add-Report 'photos-downloaded' @{ count = $count }
         # phase-done-<stage> is the shape Save-JobTelemetry sums into stageSeconds, so every
         # non-RealityScan step (fetch, optimize, ground surface, upload, delivery) reports the
         # same way the render phases do and the feed sees the whole job, not just the render.
         Add-Report 'phase-done-downloading' @{ seconds = [int]((Get-Date) - $fetchStarted).TotalSeconds; count = $count }
+        # LEARNS, like the RealityScan phases do. Save-PhaseExpectation had exactly two call sites,
+        # both inside Invoke-RsPhase, so downloading/optimizing/dem/uploading were frozen at the
+        # 97-photo seeds for ever while the rest of the plan drifted to whatever the last job's size
+        # was — half the bar learning and half of it not is worse than neither.
+        Save-PhaseExpectation 'downloading' ([int]((Get-Date) - $fetchStarted).TotalSeconds)
         if ($count -eq 0) { throw 'No photos found for this job' }
         if (Test-Cancelled $JobId) {
             Write-Status $JobId 'cancelled' 'Cancelled before processing'
@@ -3472,6 +3692,11 @@ function Invoke-Job($JobId) {
         $optimizeStarted = Get-Date
         Optimize-GeoTiffs $JobId $outDir $epsg
         Add-Report 'phase-done-optimizing' @{ seconds = [int]((Get-Date) - $optimizeStarted).TotalSeconds }
+        # LEARNS, like the RealityScan phases do. Save-PhaseExpectation had exactly two call sites,
+        # both inside Invoke-RsPhase, so downloading/optimizing/dem/uploading were frozen at the
+        # 97-photo seeds for ever while the rest of the plan drifted to whatever the last job's size
+        # was — half the bar learning and half of it not is worse than neither.
+        Save-PhaseExpectation 'optimizing' ([int]((Get-Date) - $optimizeStarted).TotalSeconds)
 
         # Derive the bare-earth ground surface from the DSM (RealityScan's own DTM option costs
         # far more time inside the ortho step than this does out here).
@@ -3484,6 +3709,11 @@ function Invoke-Job($JobId) {
             $demStarted = Get-Date
             Build-Dem $JobId $outDir
             Add-Report 'phase-done-dem' @{ seconds = [int]((Get-Date) - $demStarted).TotalSeconds }
+            # LEARNS, like the RealityScan phases do. Save-PhaseExpectation had exactly two call sites,
+            # both inside Invoke-RsPhase, so downloading/optimizing/dem/uploading were frozen at the
+            # 97-photo seeds for ever while the rest of the plan drifted to whatever the last job's size
+            # was — half the bar learning and half of it not is worse than neither.
+            Save-PhaseExpectation 'dem' ([int]((Get-Date) - $demStarted).TotalSeconds)
             # Last rung of the ladder, and the last thing the app is waiting on.
             Publish-Artifact $JobId $outDir 'dem.tif' $epsg | Out-Null
         }
@@ -3513,6 +3743,11 @@ function Invoke-Job($JobId) {
         # After Save-Report by necessity (the report is part of what was just uploaded), so this
         # entry reaches the diagnostics feed but not job-report.json.
         Add-Report 'phase-done-uploading' @{ seconds = [int]((Get-Date) - $uploadStarted).TotalSeconds }
+        # LEARNS, like the RealityScan phases do. Save-PhaseExpectation had exactly two call sites,
+        # both inside Invoke-RsPhase, so downloading/optimizing/dem/uploading were frozen at the
+        # 97-photo seeds for ever while the rest of the plan drifted to whatever the last job's size
+        # was — half the bar learning and half of it not is worse than neither.
+        Save-PhaseExpectation 'uploading' ([int]((Get-Date) - $uploadStarted).TotalSeconds)
 
         $outputs = $produced | ForEach-Object { @{ name = $_.Name; bytes = $_.Length } }
         Write-Status $JobId 'done' 'Complete' 1 $outputs
