@@ -497,12 +497,12 @@ function Save-JobTelemetry($JobId, $Depth, $PhotoCount, $Ok, $Outcome = $null, $
             } catch { $queueWait = $null }
         }
         # Who the job belongs to, copied field by field: the device and project stamps the app
-        # writes into the manifest's owner, plus the licence when it is there. Nothing else from
-        # the manifest travels - no local paths, no photo lists.
+        # writes into the manifest's owner, plus the licence and its device when they are there.
+        # Nothing else from the manifest travels - no local paths, no photo lists.
         $owner = $null
         if ($Manifest -and $Manifest.owner) {
             $owner = [ordered]@{}
-            foreach ($f in @('deviceId', 'projectName', 'projectId', 'licence')) {
+            foreach ($f in @('deviceId', 'projectName', 'projectId', 'licence', 'licenceDevice8')) {
                 $prop = $Manifest.owner.PSObject.Properties[$f]
                 if ($prop -and $null -ne $prop.Value) { $owner[$f] = $prop.Value }
             }
