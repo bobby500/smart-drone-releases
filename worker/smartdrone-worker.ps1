@@ -17,7 +17,7 @@
 # Config: C:\SmartDroneWorker\config.json (written by install-worker.ps1).
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-11-02.105'  # logged at startup — proves which script revision is running
+$ScriptVersion = '2026-11-02.106'  # logged at startup — proves which script revision is running
 $ConfigDir = 'C:\SmartDroneWorker'
 $Config = Get-Content (Join-Path $ConfigDir 'config.json') -Raw | ConvertFrom-Json
 $LogFile = Join-Path $ConfigDir 'worker.log'
@@ -551,6 +551,10 @@ function Save-JobTelemetry($JobId, $Depth, $PhotoCount, $Ok, $Outcome = $null, $
             photos        = $PhotoCount
             photoBytes    = if ($Manifest -and $Manifest.totalBytes) { [long]$Manifest.totalBytes } else { $null }
             owner         = $owner
+            # The RTK correction datum the operator gave on the flight check ('nzgd2000', 'itrf' or
+            # 'unknown'), so a flight that does not line up with the LINZ layers can be traced to its
+            # correction source. Null for a job queued by an app that did not ask.
+            rtkFrame      = if ($Manifest -and $Manifest.rtkFrame) { "$($Manifest.rtkFrame)" } else { $null }
             ok            = [bool]$Ok
             outcome       = $Outcome
             error         = if ($ErrorMessage) { "$ErrorMessage" } else { $null }
