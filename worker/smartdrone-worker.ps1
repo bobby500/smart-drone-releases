@@ -17,7 +17,7 @@
 # Config: C:\SmartDroneWorker\config.json (written by install-worker.ps1).
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-11-02.106'  # logged at startup — proves which script revision is running
+$ScriptVersion = '2026-11-02.107'  # logged at startup — proves which script revision is running
 $ConfigDir = 'C:\SmartDroneWorker'
 $Config = Get-Content (Join-Path $ConfigDir 'config.json') -Raw | ConvertFrom-Json
 $LogFile = Join-Path $ConfigDir 'worker.log'
@@ -629,8 +629,11 @@ function Get-NextJob {
 #   ortho-params.xml     = Ortho Projection Tool settings (Map (GPS) type, pixel size)
 #   export-ortho.xml     = orthomosaic GeoTIFF export
 #   export-dsm.xml       = DSM GeoTIFF export
-# Any that haven't been saved are dropped from the arguments — the CLI then uses the
-# Administrator account's last-used UI settings.
+# A job without export-ortho.xml is refused before rendering, with instructions for saving it
+# (Invoke-RealityScan); a job without export-dsm.xml skips the DSM. The alignment and ortho-params
+# files are dropped from the arguments when they have not been saved. template.rsproj and
+# template.rsortho are the other saved files, and Sync-SettingsFiles mirrors all of them to and
+# from worker/settings/ in the jobs bucket.
 # The ortho projection, set on the COMMAND LINE.
 #
 # RealityScan keeps these settings inside the project, and -newScene starts every job without
@@ -3758,7 +3761,7 @@ function Invoke-Job($JobId) {
         Add-Report 'outputs' @{ files = @($produced | ForEach-Object { "$($_.Name) ($([Math]::Round($_.Length / 1MB)) MB)" }) }
         if (-not ($produced | Where-Object { $_.Name -in @('ortho.tif', 'dsm.tif') })) {
             $script:LastCliDetail = "--- realityscan-stdout (tail) ---`n$(Get-LogTail (Join-Path $outDir 'realityscan-stdout.log') 30)"
-            throw 'RealityScan finished but produced no ortho.tif/dsm.tif - check the CLI template and export settings (see realityscan-stdout.log)'
+            throw 'RealityScan finished but produced no ortho.tif/dsm.tif - check the export settings files (see realityscan-stdout.log)'
         }
         $script:StageIndex = $script:StageCount
         Write-Status $JobId 'uploading' 'Uploading results'

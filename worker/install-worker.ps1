@@ -10,7 +10,7 @@ New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 
 Write-Host ''
 Write-Host '=== Smart Drone GPU worker setup ===' -ForegroundColor Green
-Write-Host 'Paste the same AWS keys used in the Smart Drone app (View > AI Detection > Cloud processing).'
+Write-Host 'Paste the AWS key pair for this worker (the app has no key panel; its access comes with the licence).'
 $accessKey = Read-Host 'AWS Access Key ID'
 $secretKey = Read-Host 'AWS Secret Access Key'
 if (-not $accessKey -or -not $secretKey) { throw 'Both keys are required.' }
