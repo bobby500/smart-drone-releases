@@ -1,4 +1,6 @@
 {
   "idleShutdownMinutes": 3,
-  "rdpGraceMinutes": 15
+  "rdpGraceMinutes": 15,
+  "quietShutdownMinutes": 1,
+  "pendingFreshMinutes": 8
 }

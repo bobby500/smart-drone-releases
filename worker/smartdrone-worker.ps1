@@ -17,7 +17,7 @@
 # Config: C:\SmartDroneWorker\config.json (written by install-worker.ps1).
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-11-01.104'  # logged at startup — proves which script revision is running
+$ScriptVersion = '2026-11-02.105'  # logged at startup — proves which script revision is running
 $ConfigDir = 'C:\SmartDroneWorker'
 $Config = Get-Content (Join-Path $ConfigDir 'config.json') -Raw | ConvertFrom-Json
 $LogFile = Join-Path $ConfigDir 'worker.log'
@@ -145,8 +145,19 @@ $IdleShutdownMinutes = 3
 # even with someone connected. Nothing here can stop a machine that is actually rendering — the
 # idle clock only advances between jobs.
 $RdpGraceMinutes = 15
+# QUIET SHUTDOWN: the minutes an idle machine waits when nothing is queued and no job is uploading
+# its photos (no fresh pending marker anywhere in the bucket). The idle shutdown above applies
+# instead while a fresh marker exists, and the Remote Desktop grace while someone is connected.
+$QuietShutdownMinutes = 1
+# A pending marker holds the idle shutdown only while the app keeps refreshing it: its
+# LastModified must be within this many minutes (the app rewrites it every 2 minutes for the whole
+# upload), and its startedAt within 6 hours.
+$PendingFreshMinutes = 8
+$PendingMaxHours = 6
 $IdleSource = 'default'
 $RdpGraceSource = 'default'
+$QuietSource = 'default'
+$PendingFreshSource = 'default'
 # Auto-shutdown is ON unless config.json explicitly says false. It used to be `$Config.autoShutdown
 # -and ...`, which made a MISSING key mean "never shut down" — one hand-edited or pre-flag config
 # and the box bills forever with nothing to say why (the $1,000 lesson, Aug 2026). Absent = on.
@@ -223,6 +234,10 @@ function Write-Status($JobId, $Stage, $Message, $Pct = 0, $Outputs = $null, $Det
     } catch {
         Log "Status update dropped ($($_.Exception.Message)) - the job carries on"
     }
+    # The machine's heartbeat rides on the job's own status beat, at most once a minute, so the
+    # machine reads as 'job' for exactly as long as the job reports. Stop requests are not read
+    # here: a request is only ever honoured while the machine is idle.
+    Write-Heartbeat 'job' $JobId
 }
 
 # ---- Disk space ---------------------------------------------------------------------------
@@ -548,6 +563,8 @@ function Save-JobTelemetry($JobId, $Depth, $PhotoCount, $Ok, $Outcome = $null, $
             # The idle settings in force, so the costs page can compare the idle tail across them.
             idleShutdownMinutes = $IdleShutdownMinutes
             rdpGraceMinutes     = $RdpGraceMinutes
+            quietShutdownMinutes = $QuietShutdownMinutes
+            pendingFreshMinutes  = $PendingFreshMinutes
         }
         if (Save-TelemetryObject "$JobId.json" $rec) {
             Log "Job ${JobId}: telemetry recorded ($Outcome on $($rec.instanceType), $($rec.totalSeconds)s total)"
@@ -3797,7 +3814,11 @@ function Invoke-Job($JobId) {
 # itself idle and shut down mid-upload - the box disappearing from under the very job it was
 # meant to run. A pending marker with no status.json and no cancel.json means work is coming.
 #
-# Bounded to two hours so an abandoned marker cannot keep a GPU billing indefinitely.
+# FRESH MARKERS ONLY. The app rewrites the marker every 2 minutes for the whole upload and deletes
+# it when the upload is cancelled or fails, so a marker whose LastModified is older than
+# PendingFreshMinutes belongs to an upload that has stopped (the app closed, the laptop slept, the
+# line went down) and holds nothing. A marker whose startedAt is more than PendingMaxHours old
+# holds nothing either, however recently it was written.
 function Get-PendingJobs {
     try {
         $raw = Invoke-AwsQuietOut s3api list-objects-v2 --bucket $Bucket --prefix 'jobs/' `
@@ -3806,17 +3827,33 @@ function Get-PendingJobs {
         $live = @()
         foreach ($it in $items) {
             if (-not $it.k) { continue }
-            if (((Get-Date) - [datetime]$it.t).TotalHours -gt 2) { continue }
+            if (((Get-Date) - [datetime]$it.t).TotalMinutes -gt $PendingFreshMinutes) { continue }
             $id = ($it.k -split '/')[1]
             # Already running or already dealt with? Then it is not "coming".
             $done = Invoke-AwsQuietOut s3 ls "s3://$Bucket/jobs/$id/status.json"
             if ($done) { continue }
             $cancelled = Invoke-AwsQuietOut s3 ls "s3://$Bucket/jobs/$id/cancel.json"
             if ($cancelled) { continue }
+            $started = Get-PendingStartedUtc $id
+            if ($started -and ((Get-Date).ToUniversalTime() - $started).TotalHours -gt $PendingMaxHours) { continue }
             $live += $id
         }
         return $live
     } catch { return @() }
+}
+
+# The startedAt the app wrote into jobs/<id>/pending.json, as UTC, or $null when the marker cannot
+# be read or carries none. Windows PowerShell leaves the ISO text as a string; PowerShell 7 turns it
+# into a DateTime - both are accepted.
+function Get-PendingStartedUtc($JobId) {
+    try {
+        $raw = Invoke-AwsQuietOut s3 cp "s3://$Bucket/jobs/$JobId/pending.json" - --no-progress
+        if (-not $raw) { return $null }
+        $m = ($raw -join "`n") | ConvertFrom-Json
+        if (-not $m -or -not $m.startedAt) { return $null }
+        if ($m.startedAt -is [datetime]) { return $m.startedAt.ToUniversalTime() }
+        return [DateTimeOffset]::Parse("$($m.startedAt)", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+    } catch { return $null }
 }
 
 # ---- Rescue before shutdown --------------------------------------------------------------------
@@ -3860,6 +3897,129 @@ function Rescue-UnuploadedOutputs {
 function Invoke-AwsQuietOut {
     $ErrorActionPreference = 'Continue'
     try { return (& aws @args 2>$null) } catch { return @() }
+}
+
+# ---- Heartbeat and stop requests ---------------------------------------------------------------
+#
+# telemetry/instance/<instanceId>/alive.json is this machine's heartbeat, overwritten about once a
+# minute and straight away whenever the state changes:
+#   { at, state, jobId, idleSince, scriptVersion, instanceType, autoShutdown,
+#     settings: { idle, quiet, rdp, fresh } }
+# state is 'idle' | 'job' | 'holding-upload' | 'holding-rdp' | 'gpu-check'. The licence server
+# (proxy/reaper.js) reads it: a fresh 'job' heartbeat is never touched; an idle machine well past its
+# own idle setting, or one whose heartbeat has stopped, is asked to stop and then stopped.
+#
+# control/stop/<instanceId>.json is that request. It is honoured ONLY while the machine is idle: it
+# is read about once a minute from the idle branch of the main loop and never while a job runs,
+# whatever the request says. (The control/stop/ prefix is writable by the credentials every
+# licensed install holds, so a request is not proof it came from the licence server; a request
+# can therefore end idle time and nothing else.) A request that arrives during a job is read once
+# the job has ended and the machine is idle again. Obeying it rescues unuploaded outputs, records
+# the shutdown, deletes the request and stops the machine. A request written before this machine
+# last booted is stale: it is deleted and ignored, so a request that outlived its machine can never
+# stop the next boot.
+#
+# Nothing here may throw out of the loop: a heartbeat or a check that fails is logged once and
+# tried again a minute later.
+$script:HeartbeatAt = [datetime]::MinValue
+$script:HeartbeatState = ''
+$script:HeartbeatFailLogged = $false
+$script:StopCheckAt = [datetime]::MinValue
+$script:WorkerStartedAt = Get-Date
+$script:BootedAtUtc = $script:WorkerStartedAt.ToUniversalTime()
+try { $script:BootedAtUtc = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() } catch { }
+
+function Write-Heartbeat($State, $JobId = $null, $IdleSince = $null) {
+    try {
+        $now = Get-Date
+        if ($State -eq $script:HeartbeatState -and ($now - $script:HeartbeatAt).TotalSeconds -lt 60) { return }
+        $script:HeartbeatAt = $now
+        $script:HeartbeatState = $State
+        $since = $null
+        if ($IdleSince) { $since = ([datetime]$IdleSince).ToUniversalTime().ToString('o') }
+        $rec = [ordered]@{
+            at            = $now.ToUniversalTime().ToString('o')
+            state         = "$State"
+            jobId         = $JobId
+            idleSince     = $since
+            scriptVersion = $ScriptVersion
+            instanceType  = Get-InstanceType
+            autoShutdown  = [bool]$AutoShutdownOn
+            settings      = [ordered]@{ idle = $IdleShutdownMinutes; quiet = $QuietShutdownMinutes; rdp = $RdpGraceMinutes; fresh = $PendingFreshMinutes }
+        }
+        $tmp = Join-Path $TempDir 'sd-alive.json'
+        [IO.File]::WriteAllText($tmp, ($rec | ConvertTo-Json -Depth 4))
+        $rc = Invoke-AwsQuiet s3 cp $tmp "s3://$Bucket/telemetry/instance/$(Get-InstanceId)/alive.json" --no-progress
+        if ($rc -eq 0) {
+            $script:HeartbeatFailLogged = $false
+        } elseif (-not $script:HeartbeatFailLogged) {
+            $script:HeartbeatFailLogged = $true
+            Log "Heartbeat not written (aws exit $rc) - tried again every minute, logged once"
+        }
+    } catch {
+        if (-not $script:HeartbeatFailLogged) {
+            $script:HeartbeatFailLogged = $true
+            Log "Heartbeat not written ($($_.Exception.Message)) - tried again every minute, logged once"
+        }
+    }
+}
+
+# The stop request for this machine as @{ reason; key }, or $null when there is none or it cannot
+# be read. A request that is there but is not JSON still counts.
+function Read-StopRequest {
+    $tmp = Join-Path $TempDir 'sd-stop-request.json'
+    $key = "control/stop/$(Get-InstanceId).json"
+    try {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        $meta = Invoke-AwsQuietOut s3api get-object --bucket $Bucket --key $key $tmp
+        if (-not $meta -or -not (Test-Path $tmp)) { return $null }
+        $written = $null
+        try {
+            $lm = (($meta -join "`n") | ConvertFrom-Json).LastModified
+            if ($lm -is [datetime]) { $written = $lm.ToUniversalTime() }
+            elseif ($lm) { $written = [DateTimeOffset]::Parse("$lm", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
+        } catch { $written = $null }
+        $req = $null
+        try { $req = (Get-Content $tmp -Raw) | ConvertFrom-Json } catch { $req = $null }
+        $reason = 'no reason given'
+        if ($req -and $req.reason) { $reason = ("$($req.reason)" -replace '[\r\n]+', ' ').Trim() }
+        if ($reason.Length -gt 200) { $reason = $reason.Substring(0, 200) }
+        if ($written -and $written -lt $script:BootedAtUtc) {
+            Log "A stop request written before this machine booted ($reason) - removing it and carrying on"
+            Invoke-AwsQuiet s3 rm "s3://$Bucket/$key" --only-show-errors | Out-Null
+            return $null
+        }
+        return @{ reason = $reason; key = $key }
+    } catch {
+        return $null
+    } finally {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Obeys a stop request on an idle machine: outputs on the scratch drive go to S3 first, then the
+# shutdown record, then the request is deleted and the machine stops.
+function Invoke-StopRequest($Request, $IdleSince = $null) {
+    $idle = 0
+    try { if ($IdleSince) { $idle = [int]((Get-Date) - [datetime]$IdleSince).TotalMinutes } } catch { $idle = 0 }
+    Log "Stop request from the licence server ($($Request.reason)) - rescuing outputs, then shutting down"
+    try { Rescue-UnuploadedOutputs } catch { }
+    try { Save-InstanceEvent 'shutdown' ([ordered]@{ why = "asked by the licence server: $($Request.reason)"; idleMinutes = $idle; jobsRun = [int]$script:JobsRun }) } catch { }
+    try { Invoke-AwsQuiet s3 rm "s3://$Bucket/$($Request.key)" --only-show-errors | Out-Null } catch { }
+    try { Stop-Computer -Force } catch { Log "Stop-Computer failed: $($_.Exception.Message)" }
+    exit
+}
+
+# About once a minute, from the idle branch of the main loop only: is there a stop request for
+# this machine? If so it is obeyed. Never called while a job runs.
+function Test-StopRequest($IdleSince = $null) {
+    try {
+        if (((Get-Date) - $script:StopCheckAt).TotalSeconds -lt 60) { return }
+        $script:StopCheckAt = Get-Date
+        $req = Read-StopRequest
+        if (-not $req) { return }
+        Invoke-StopRequest $req $IdleSince
+    } catch { }
 }
 
 # The remote command channel (agent-shell.ps1) is how this box is reached without Remote Desktop,
@@ -4052,17 +4212,22 @@ function Select-IdleSetting($Candidates, $Min, $Max, $Default) {
     return @{ value = $Default; source = 'default'; skipped = $skipped }
 }
 
-# Idle shutdown 2-240 minutes, Remote Desktop grace 5-240: the S3 override, then the fleet
-# settings, then config.json, then the defaults above. Logged with where each value came from, and
-# carried on the boot record and every job record so the costs page can set the idle tail against
-# the setting in force. A failure here keeps the defaults: the settings must never stop the worker.
+# Idle shutdown 2-240 minutes, Remote Desktop grace 5-240, quiet shutdown 1-60, pending-marker
+# freshness 3-60: the S3 override, then the fleet settings, then config.json, then the defaults
+# above. Logged with where each value came from, and carried on the boot record and every job
+# record so the costs page can set the idle tail against the setting in force. A failure here keeps
+# the defaults: the settings must never stop the worker.
 try {
     $fleet = Read-FleetSettings
     $fleetIdle = $null
     $fleetRdp = $null
+    $fleetQuiet = $null
+    $fleetFresh = $null
     if ($fleet) {
         $fleetIdle = $fleet.idleShutdownMinutes
         $fleetRdp = $fleet.rdpGraceMinutes
+        $fleetQuiet = $fleet.quietShutdownMinutes
+        $fleetFresh = $fleet.pendingFreshMinutes
     }
     $idleCandidates = @(
         @{ value = (Read-S3Setting 'idle-minutes.txt'); source = 'S3 override' },
@@ -4074,16 +4239,32 @@ try {
         @{ value = $fleetRdp; source = 'fleet settings' },
         @{ value = $Config.rdpGraceMinutes; source = 'config.json' }
     )
+    $quietCandidates = @(
+        @{ value = (Read-S3Setting 'quiet-minutes.txt'); source = 'S3 override' },
+        @{ value = $fleetQuiet; source = 'fleet settings' },
+        @{ value = $Config.quietShutdownMinutes; source = 'config.json' }
+    )
+    $freshCandidates = @(
+        @{ value = (Read-S3Setting 'pending-fresh-minutes.txt'); source = 'S3 override' },
+        @{ value = $fleetFresh; source = 'fleet settings' },
+        @{ value = $Config.pendingFreshMinutes; source = 'config.json' }
+    )
     $idlePick = Select-IdleSetting $idleCandidates 2 240 3
     $rdpPick = Select-IdleSetting $rdpCandidates 5 240 15
+    $quietPick = Select-IdleSetting $quietCandidates 1 60 1
+    $freshPick = Select-IdleSetting $freshCandidates 3 60 8
     $IdleShutdownMinutes = $idlePick.value
     $IdleSource = $idlePick.source
     $RdpGraceMinutes = $rdpPick.value
     $RdpGraceSource = $rdpPick.source
-    $ignored = @($idlePick.skipped) + @($rdpPick.skipped)
-    Log ("Idle settings: shutdown after ${IdleShutdownMinutes} min idle ($IdleSource), Remote Desktop grace ${RdpGraceMinutes} min ($RdpGraceSource)" + $(if ($ignored.Count) { '; out of bounds and ignored: ' + ($ignored -join ', ') } else { '' }))
+    $QuietShutdownMinutes = $quietPick.value
+    $QuietSource = $quietPick.source
+    $PendingFreshMinutes = $freshPick.value
+    $PendingFreshSource = $freshPick.source
+    $ignored = @($idlePick.skipped) + @($rdpPick.skipped) + @($quietPick.skipped) + @($freshPick.skipped)
+    Log ("Idle settings: shutdown after ${IdleShutdownMinutes} min idle ($IdleSource), Remote Desktop grace ${RdpGraceMinutes} min ($RdpGraceSource), quiet shutdown after ${QuietShutdownMinutes} min with nothing coming ($QuietSource), upload markers fresh for ${PendingFreshMinutes} min ($PendingFreshSource)" + $(if ($ignored.Count) { '; out of bounds and ignored: ' + ($ignored -join ', ') } else { '' }))
 } catch {
-    Log "Idle settings could not be resolved ($($_.Exception.Message)) - using ${IdleShutdownMinutes} min idle and ${RdpGraceMinutes} min Remote Desktop grace"
+    Log "Idle settings could not be resolved ($($_.Exception.Message)) - using ${IdleShutdownMinutes} min idle, ${RdpGraceMinutes} min Remote Desktop grace, ${QuietShutdownMinutes} min quiet shutdown and ${PendingFreshMinutes} min upload-marker freshness"
 }
 
 # Also on STARTUP, not just before shutdown. A worker RESTART leaves the scratch disk intact
@@ -4100,12 +4281,15 @@ Rescue-UnuploadedOutputs
 Clear-RsCache | Out-Null
 Clear-OldJobDirs
 
-Log "Worker started (script $ScriptVersion, bucket $Bucket, session $SessionId, workDir $WorkDir [$(Get-FreeGB $WorkDir) GB free, C: $(Get-FreeGB 'C:\') GB free], RealityScan cache $RsTempDir, poll ${PollSeconds}s, idle shutdown ${IdleShutdownMinutes}m, Remote Desktop grace ${RdpGraceMinutes}m)"
+Log "Worker started (script $ScriptVersion, bucket $Bucket, session $SessionId, workDir $WorkDir [$(Get-FreeGB $WorkDir) GB free, C: $(Get-FreeGB 'C:\') GB free], RealityScan cache $RsTempDir, poll ${PollSeconds}s, idle shutdown ${IdleShutdownMinutes}m, Remote Desktop grace ${RdpGraceMinutes}m, quiet shutdown ${QuietShutdownMinutes}m, upload markers fresh ${PendingFreshMinutes}m)"
 Sync-SettingsFiles
 Restore-AgentChannel
 # First entry in this boot's timeline for the admin diagnostics feed (see Save-InstanceEvent),
 # with the idle settings this boot runs under.
-Save-InstanceEvent 'boot' ([ordered]@{ idleShutdownMinutes = $IdleShutdownMinutes; rdpGraceMinutes = $RdpGraceMinutes })
+Save-InstanceEvent 'boot' ([ordered]@{ idleShutdownMinutes = $IdleShutdownMinutes; rdpGraceMinutes = $RdpGraceMinutes; quietShutdownMinutes = $QuietShutdownMinutes; pendingFreshMinutes = $PendingFreshMinutes })
+# The first heartbeat: the GPU check below can install a driver and reboot, and the licence server
+# gives a machine in 'gpu-check' 20 minutes before it counts it as idle.
+Write-Heartbeat 'gpu-check' $null $script:WorkerStartedAt
 # CAN THIS MACHINE RENDER? Asked before the loop can claim a single job, because a box with no
 # usable GPU cannot do the work and the failure is otherwise invisible until RealityScan is
 # already up and waiting behind a modal error box. A missing driver is installed and the machine
@@ -4132,7 +4316,15 @@ while ($true) {
             Restore-AgentChannel   # a long render is plenty of time for the channel to die
         } else {
             $idleMin = ((Get-Date) - $lastWork).TotalMinutes
-            if ($AutoShutdownOn -and $idleMin -ge $IdleShutdownMinutes) {
+            $idleState = 'idle'
+            # Which clock applies depends on what might be coming. Nothing queued (this poll found
+            # no job) and no fresh pending marker anywhere: the QUIET shutdown, after
+            # QuietShutdownMinutes. A fresh marker (a job uploading its photos): held while the
+            # marker stays fresh, and never stopped before IdleShutdownMinutes. Someone on Remote
+            # Desktop: RdpGraceMinutes. The first decision therefore comes at the shorter of the
+            # quiet and idle settings.
+            $firstCheckMin = [Math]::Min($QuietShutdownMinutes, $IdleShutdownMinutes)
+            if ($AutoShutdownOn -and $idleMin -ge $firstCheckMin) {
                 # Someone working over Remote Desktop gets a GRACE PERIOD, not an indefinite
                 # reprieve — an RDP session left open used to keep a $2/h machine alive all
                 # night. quser writes 'No User exists for *' to stderr when nobody is logged
@@ -4146,6 +4338,7 @@ while ($true) {
                     $ErrorActionPreference = 'Stop'
                 }
                 if ($rdpActive -and $idleMin -lt $RdpGraceMinutes) {
+                    $idleState = 'holding-rdp'
                     if (-not $script:RdpHoldLogged) {
                         $script:RdpHoldLogged = $true
                         Log "Idle for $([int]$idleMin) min but someone is on Remote Desktop - holding the shutdown until $RdpGraceMinutes min idle"
@@ -4155,23 +4348,29 @@ while ($true) {
                     # than in the poll loop - one S3 list per shutdown decision, not per poll.
                     $pending = Get-PendingJobs
                     if ($pending.Count) {
+                        $idleState = 'holding-upload'
                         if (-not $script:PendingHoldLogged) {
                             $script:PendingHoldLogged = $true
-                            Log "Idle for $([int]$idleMin) min but $($pending.Count) job(s) are still uploading photos - holding the shutdown"
+                            Log "Idle for $([int]$idleMin) min but $($pending.Count) job(s) are still uploading photos - holding the shutdown while the upload marker stays fresh"
                         }
-                        Start-Sleep -Seconds $PollSeconds
-                        continue
+                    } elseif ($rdpActive -or $idleMin -ge $QuietShutdownMinutes) {
+                        $script:PendingHoldLogged = $false
+                        $why = "idle $([int]$idleMin) min"
+                        if ($rdpActive) { $why = "idle $([int]$idleMin) min (past the ${RdpGraceMinutes}m Remote Desktop grace)" }
+                        elseif ($idleMin -lt $IdleShutdownMinutes) { $why = "idle $([int]$idleMin) min with nothing queued or uploading (quiet shutdown after ${QuietShutdownMinutes}m)" }
+                        Rescue-UnuploadedOutputs
+                        Log "Shutting down to stop billing - $why"
+                        # Last entry in this boot's timeline: why it stopped, and what it did.
+                        Save-InstanceEvent 'shutdown' ([ordered]@{ why = $why; idleMinutes = [int]$idleMin; jobsRun = [int]$script:JobsRun })
+                        Stop-Computer -Force
+                        exit
                     }
-                    $script:PendingHoldLogged = $false
-                    $why = if ($rdpActive) { "idle $([int]$idleMin) min (past the ${RdpGraceMinutes}m Remote Desktop grace)" } else { "idle $([int]$idleMin) min" }
-                    Rescue-UnuploadedOutputs
-                    Log "Shutting down to stop billing - $why"
-                    # Last entry in this boot's timeline: why it stopped, and what it did.
-                    Save-InstanceEvent 'shutdown' ([ordered]@{ why = $why; idleMinutes = [int]$idleMin; jobsRun = [int]$script:JobsRun })
-                    Stop-Computer -Force
-                    exit
                 }
             }
+            # What this machine is doing, for the licence server, and whether it has been asked to
+            # stop. Both at most once a minute; neither can throw.
+            Write-Heartbeat $idleState $null $lastWork
+            Test-StopRequest $lastWork
         }
         $script:LoopErrors = 0
     } catch {
