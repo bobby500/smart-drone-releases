@@ -1,0 +1,4 @@
+{
+  "idleShutdownMinutes": 3,
+  "rdpGraceMinutes": 15
+}

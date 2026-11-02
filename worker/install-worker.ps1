@@ -33,7 +33,8 @@ $config = [ordered]@{
     bucket = 'smartdrone-jobs-232812966415'
     workDir = 'C:\SmartDroneJobs'
     pollSeconds = 15
-    idleShutdownMinutes = 10
+    idleShutdownMinutes = 3
+    rdpGraceMinutes = 15
     autoShutdown = $true
     rsExe = 'auto'
 }

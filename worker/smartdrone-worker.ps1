@@ -17,7 +17,7 @@
 # Config: C:\SmartDroneWorker\config.json (written by install-worker.ps1).
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-09-08.103'  # logged at startup — proves which script revision is running
+$ScriptVersion = '2026-11-01.104'  # logged at startup — proves which script revision is running
 $ConfigDir = 'C:\SmartDroneWorker'
 $Config = Get-Content (Join-Path $ConfigDir 'config.json') -Raw | ConvertFrom-Json
 $LogFile = Join-Path $ConfigDir 'worker.log'
@@ -131,17 +131,22 @@ New-Item -ItemType Directory -Force -Path $TempDir -ErrorAction SilentlyContinue
 $env:TEMP = $RsTempDir
 $env:TMP = $RsTempDir
 $PollSeconds = if ($Config.pollSeconds) { $Config.pollSeconds } else { 15 }
-# Idle shutdown, in precedence order: an S3 override, then local config, then 10 minutes.
-# The S3 override exists so this can be tuned WITHOUT touching the machine — during a debugging
-# session a 10-minute shutdown turns every gap between jobs into a boot cycle, and reaching the
-# box to change it needs the box to be up. Delete the object to go back to the local default.
-$IdleShutdownMinutes = if ($Config.idleShutdownMinutes) { $Config.idleShutdownMinutes } else { 10 }
+# Idle shutdown: the minutes a machine with no job waits before it shuts itself down. These are
+# the defaults; at startup (see Select-IdleSetting, before the first poll) each setting takes the
+# first sane value of, in order: the S3 override in the jobs bucket (worker/idle-minutes.txt,
+# worker/rdp-grace-minutes.txt), the fleet settings published beside this script
+# (worker/fleet-settings.json on the releases repo), local config.json, then these. The S3
+# override changes the setting WITHOUT touching a machine or the repo - a quick test on the fleet;
+# delete the object to go back.
+$IdleShutdownMinutes = 3
 # COST GUARD (field: the machine billed for ~16 h while a wedged render "ran", and an open
 # Remote Desktop session used to postpone the idle shutdown indefinitely). An idle machine now
 # always shuts down: after IdleShutdownMinutes with nobody on RDP, or after RdpGraceMinutes
 # even with someone connected. Nothing here can stop a machine that is actually rendering — the
 # idle clock only advances between jobs.
-$RdpGraceMinutes = if ($Config.rdpGraceMinutes) { [int]$Config.rdpGraceMinutes } else { 60 }
+$RdpGraceMinutes = 15
+$IdleSource = 'default'
+$RdpGraceSource = 'default'
 # Auto-shutdown is ON unless config.json explicitly says false. It used to be `$Config.autoShutdown
 # -and ...`, which made a MISSING key mean "never shut down" — one hand-edited or pre-flag config
 # and the box bills forever with nothing to say why (the $1,000 lesson, Aug 2026). Absent = on.
@@ -540,6 +545,9 @@ function Save-JobTelemetry($JobId, $Depth, $PhotoCount, $Ok, $Outcome = $null, $
             totalSeconds  = if ($script:JobStarted) { [int]((Get-Date) - $script:JobStarted).TotalSeconds } else { 0 }
             queueWaitSec  = $queueWait
             stageSeconds  = $stages
+            # The idle settings in force, so the costs page can compare the idle tail across them.
+            idleShutdownMinutes = $IdleShutdownMinutes
+            rdpGraceMinutes     = $RdpGraceMinutes
         }
         if (Save-TelemetryObject "$JobId.json" $rec) {
             Log "Job ${JobId}: telemetry recorded ($Outcome on $($rec.instanceType), $($rec.totalSeconds)s total)"
@@ -3440,6 +3448,7 @@ function Invoke-Job($JobId) {
             if ($LASTEXITCODE -ne 0) { throw 'Result upload to S3 failed' }
             Write-Status $JobId 'done' 'Complete' 1
             Log "Job ${JobId}: optimize job done"
+            Save-JobTelemetry $JobId 'optimize' 1 $true 'done' $null $manifest
             return
         }
 
@@ -3515,6 +3524,9 @@ function Invoke-Job($JobId) {
             try { $auc = " (validation AUC $(([Math]::Round((Get-Content $metricsFile -Raw | ConvertFrom-Json).valAuc, 3)))" + ')' } catch { }
             Write-Status $JobId 'done' "Classifier trained and published$auc" 1
             Log "Job ${JobId}: weedtrain job done for weed $weedId$auc"
+            # A finished training job leaves a job record like a render does, so its machine time
+            # is on its owner's usage page rather than counted as a machine that ran no job.
+            Save-JobTelemetry $JobId 'weedtrain' 0 $true 'done' $null $manifest
             return
         }
 
@@ -3990,15 +4002,89 @@ public static extern bool SetConsoleMode(System.IntPtr h, uint m);
     }
 } catch { Log "Could not disable console QuickEdit: $($_.Exception.Message)" }
 
-try {
-    $idleTmp = Join-Path $TempDir 'sd-idle-minutes.txt'
-    Remove-Item $idleTmp -Force -ErrorAction SilentlyContinue
-    if ((Invoke-AwsQuiet s3 cp "s3://$Bucket/worker/idle-minutes.txt" $idleTmp --no-progress) -eq 0 -and (Test-Path $idleTmp)) {
-        $v = [double]((Get-Content $idleTmp -Raw).Trim())
-        # Sanity-bounded: a typo here either bills all night or shuts down mid-render.
-        if ($v -ge 5 -and $v -le 240) { $IdleShutdownMinutes = $v }
+# ---- Idle settings ------------------------------------------------------------------------------
+# The fleet-wide settings CI publishes beside this script. Changing them is a commit to
+# worker/fleet-settings.json in the app repo: every machine picks the new values up at its next
+# start, with no hands on any box.
+$FleetSettingsUrl = 'https://raw.githubusercontent.com/bobby500/smart-drone-releases/main/worker/fleet-settings.json'
+
+# The parsed fleet settings, or $null when they cannot be read (no network, no file yet, not
+# JSON). A short timeout: a slow answer must not hold up the first poll.
+function Read-FleetSettings {
+    try {
+        $r = Invoke-WebRequest $FleetSettingsUrl -UseBasicParsing -TimeoutSec 10
+        return ($r.Content | ConvertFrom-Json)
+    } catch {
+        return $null
     }
-} catch { }
+}
+
+# The trimmed text of worker/<Name> in the jobs bucket, or $null when there is no such object.
+function Read-S3Setting($Name) {
+    $tmp = Join-Path $TempDir ('sd-setting-' + $Name)
+    try {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        if ((Invoke-AwsQuiet s3 cp "s3://$Bucket/worker/$Name" $tmp --no-progress) -eq 0 -and (Test-Path $tmp)) {
+            return ((Get-Content $tmp -Raw) + '').Trim()
+        }
+    } catch { }
+    finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    return $null
+}
+
+# One idle setting from its sources, highest first. Each candidate is @{ value; source }; the first
+# whose value reads as a number within [Min, Max] wins. A value outside the bounds is skipped and
+# named in .skipped - a typo can neither bill all night nor shut a machine down between the jobs
+# of one batch. Nothing usable gives the default.
+function Select-IdleSetting($Candidates, $Min, $Max, $Default) {
+    $skipped = @()
+    foreach ($c in $Candidates) {
+        if ($null -eq $c.value) { continue }
+        $text = ("" + $c.value).Trim()
+        if ($text -eq '') { continue }
+        $v = 0.0
+        $ok = [double]::TryParse($text, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)
+        if ($ok -and $v -ge $Min -and $v -le $Max) {
+            return @{ value = $v; source = $c.source; skipped = $skipped }
+        }
+        $skipped += ($c.source + ' (' + $text + ')')
+    }
+    return @{ value = $Default; source = 'default'; skipped = $skipped }
+}
+
+# Idle shutdown 2-240 minutes, Remote Desktop grace 5-240: the S3 override, then the fleet
+# settings, then config.json, then the defaults above. Logged with where each value came from, and
+# carried on the boot record and every job record so the costs page can set the idle tail against
+# the setting in force. A failure here keeps the defaults: the settings must never stop the worker.
+try {
+    $fleet = Read-FleetSettings
+    $fleetIdle = $null
+    $fleetRdp = $null
+    if ($fleet) {
+        $fleetIdle = $fleet.idleShutdownMinutes
+        $fleetRdp = $fleet.rdpGraceMinutes
+    }
+    $idleCandidates = @(
+        @{ value = (Read-S3Setting 'idle-minutes.txt'); source = 'S3 override' },
+        @{ value = $fleetIdle; source = 'fleet settings' },
+        @{ value = $Config.idleShutdownMinutes; source = 'config.json' }
+    )
+    $rdpCandidates = @(
+        @{ value = (Read-S3Setting 'rdp-grace-minutes.txt'); source = 'S3 override' },
+        @{ value = $fleetRdp; source = 'fleet settings' },
+        @{ value = $Config.rdpGraceMinutes; source = 'config.json' }
+    )
+    $idlePick = Select-IdleSetting $idleCandidates 2 240 3
+    $rdpPick = Select-IdleSetting $rdpCandidates 5 240 15
+    $IdleShutdownMinutes = $idlePick.value
+    $IdleSource = $idlePick.source
+    $RdpGraceMinutes = $rdpPick.value
+    $RdpGraceSource = $rdpPick.source
+    $ignored = @($idlePick.skipped) + @($rdpPick.skipped)
+    Log ("Idle settings: shutdown after ${IdleShutdownMinutes} min idle ($IdleSource), Remote Desktop grace ${RdpGraceMinutes} min ($RdpGraceSource)" + $(if ($ignored.Count) { '; out of bounds and ignored: ' + ($ignored -join ', ') } else { '' }))
+} catch {
+    Log "Idle settings could not be resolved ($($_.Exception.Message)) - using ${IdleShutdownMinutes} min idle and ${RdpGraceMinutes} min Remote Desktop grace"
+}
 
 # Also on STARTUP, not just before shutdown. A worker RESTART leaves the scratch disk intact
 # but abandons whatever the previous run was partway through - and the pre-shutdown rescue does
@@ -4014,11 +4100,12 @@ Rescue-UnuploadedOutputs
 Clear-RsCache | Out-Null
 Clear-OldJobDirs
 
-Log "Worker started (script $ScriptVersion, bucket $Bucket, session $SessionId, workDir $WorkDir [$(Get-FreeGB $WorkDir) GB free, C: $(Get-FreeGB 'C:\') GB free], RealityScan cache $RsTempDir, poll ${PollSeconds}s, idle shutdown ${IdleShutdownMinutes}m)"
+Log "Worker started (script $ScriptVersion, bucket $Bucket, session $SessionId, workDir $WorkDir [$(Get-FreeGB $WorkDir) GB free, C: $(Get-FreeGB 'C:\') GB free], RealityScan cache $RsTempDir, poll ${PollSeconds}s, idle shutdown ${IdleShutdownMinutes}m, Remote Desktop grace ${RdpGraceMinutes}m)"
 Sync-SettingsFiles
 Restore-AgentChannel
-# First entry in this boot's timeline for the admin diagnostics feed (see Save-InstanceEvent).
-Save-InstanceEvent 'boot'
+# First entry in this boot's timeline for the admin diagnostics feed (see Save-InstanceEvent),
+# with the idle settings this boot runs under.
+Save-InstanceEvent 'boot' ([ordered]@{ idleShutdownMinutes = $IdleShutdownMinutes; rdpGraceMinutes = $RdpGraceMinutes })
 # CAN THIS MACHINE RENDER? Asked before the loop can claim a single job, because a box with no
 # usable GPU cannot do the work and the failure is otherwise invisible until RealityScan is
 # already up and waiting behind a modal error box. A missing driver is installed and the machine
